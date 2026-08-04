@@ -79,6 +79,7 @@ internal sealed class MainForm : Form
 
     private readonly CredentialManager _credentialManager = new(new WindowsCredentialVault());
     private readonly SyncStatusStore _syncStatusStore;
+    private readonly OrderSnapshotStore _orderSnapshotStore;
     private readonly WmsApiClient _wmsClient;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
     private PreviewResult? _lastPreview;
@@ -92,6 +93,10 @@ internal sealed class MainForm : Form
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "MidAutumnGiftBox",
             "sync-status.json"));
+        _orderSnapshotStore = new OrderSnapshotStore(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MidAutumnGiftBox",
+            "order-snapshot.json"));
 
         Text = "中秋禮盒－WMS 資料預覽";
         StartPosition = FormStartPosition.CenterScreen;
@@ -296,6 +301,10 @@ internal sealed class MainForm : Form
                 }
 
                 var finishedAt = DateTimeOffset.Now;
+                await _orderSnapshotStore.ReplaceSourceAsync(
+                    source.Code,
+                    result.Rows,
+                    finishedAt);
                 ShowPreview(result);
                 try
                 {
@@ -309,7 +318,7 @@ internal sealed class MainForm : Form
                         result.Metadata.PageCount,
                         result.Metadata.RowCount));
                     await LoadSyncStatusAsync(source.Code);
-                    return result.Message;
+                    return result.Message + "；本機訂單快照已更新。";
                 }
                 catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
                 {
@@ -318,7 +327,8 @@ internal sealed class MainForm : Form
                 }
             }
             catch (Exception exception) when (exception is WmsApiException or ArgumentException or
-                                              InvalidOperationException or Win32Exception)
+                                              InvalidOperationException or Win32Exception or IOException or
+                                              UnauthorizedAccessException or System.Text.Json.JsonException)
             {
                 try
                 {

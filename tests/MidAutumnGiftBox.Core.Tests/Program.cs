@@ -25,6 +25,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("API ID 被修改時不可默默使用舊 Key", EditedApiIdCannotReuseSavedKey),
     ("同步失敗會保留該來源先前的最後成功時間", SyncFailurePreservesLastSuccessfulRun),
     ("同步查詢日期固定使用台北時區", SyncQueryDateUsesTaipeiTimeZone),
+    ("來源訂單快照重跑會更新商品且不影響另一來源", OrderSnapshotReplacesOneSourceWithoutDuplicates),
 };
 
 var failed = 0;
@@ -924,6 +925,73 @@ static Task SyncQueryDateUsesTaipeiTimeZone()
     Equal(new DateOnly(2026, 8, 5), WmsQueryPolicy.GetTaipeiDate(utcInstant),
         "UTC evening should already be the next order-query date in Taipei.");
     return Task.CompletedTask;
+}
+
+static async Task OrderSnapshotReplacesOneSourceWithoutDuplicates()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-orders-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "order-snapshot.json");
+    var store = new OrderSnapshotStore(path);
+    var synchronizedAt = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    var site1Rows = new IReadOnlyDictionary<string, string?>[]
+    {
+        new Dictionary<string, string?>
+        {
+            ["order_no"] = "SAME-001",
+            ["order_date"] = "2026/08/04 11:36:00",
+            ["arrival_date"] = null,
+            ["source_key"] = "shopee",
+            ["shop_name"] = "芝初 SesaOle",
+            ["derived_shipping_date"] = "2026-08-24",
+            ["status_code"] = "F",
+            ["products"] = """
+                [{"sku":"BOX-001","item_no":"P01","name":"蛋黃酥禮盒","spec":"8/22-8/28當週出貨","qty":1,"shipp_qty":0,
+                  "items":[{"sku":"4710964232565","item_no":"I01","name":"蛋黃酥9入","qty":9,"shipp_qty":0}]}]
+                """
+        }
+    };
+    var site2Rows = new IReadOnlyDictionary<string, string?>[]
+    {
+        new Dictionary<string, string?>
+        {
+            ["order_no"] = "SAME-001",
+            ["source_key"] = "official",
+            ["status_code"] = "F",
+            ["products"] = """[{"sku":"4710964232411","name":"Flavor 蛋黃酥","qty":2,"shipp_qty":1}]"""
+        }
+    };
+
+    try
+    {
+        await store.ReplaceSourceAsync("site1", site1Rows, synchronizedAt);
+        await store.ReplaceSourceAsync("site2", site2Rows, synchronizedAt);
+
+        var updatedSite1Rows = new IReadOnlyDictionary<string, string?>[]
+        {
+            new Dictionary<string, string?>
+            {
+                ["order_no"] = "SAME-001",
+                ["source_key"] = "shopee",
+                ["status_code"] = "F",
+                ["products"] = """[{"sku":"BOX-001","item_no":"P01","name":"蛋黃酥禮盒","qty":3,"shipp_qty":1}]"""
+            }
+        };
+        await new OrderSnapshotStore(path).ReplaceSourceAsync("site1", updatedSite1Rows, synchronizedAt.AddMinutes(5));
+
+        var snapshot = await new OrderSnapshotStore(path).GetAllAsync();
+        Equal(2, snapshot.Count, "Replacing site1 should remove its stale item without duplicating either source.");
+        var site1 = snapshot.Single(line => line.SourceCode == "site1");
+        var site2 = snapshot.Single(line => line.SourceCode == "site2");
+        Equal("SAME-001", site1.ExternalOrderNo, "The site1 order number was not preserved.");
+        Equal("parent:item_no:P01:1", site1.ExternalLineKey, "The stable parent line key is incorrect.");
+        Equal(3m, site1.Quantity, "The repeated site1 sync did not update quantity.");
+        Equal(1m, site1.ShippedQuantity, "The repeated site1 sync did not update shipped quantity.");
+        Equal("4710964232411", site2.Sku, "Replacing site1 incorrectly changed site2.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
 }
 
 static HttpResponseMessage Json(string value) => new(HttpStatusCode.OK)
