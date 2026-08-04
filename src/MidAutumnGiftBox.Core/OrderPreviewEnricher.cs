@@ -1,0 +1,242 @@
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+
+namespace MidAutumnGiftBox.Core;
+
+public static partial class OrderPreviewEnricher
+{
+    private static readonly string[] ApplicationOwnedShippingFields =
+    [
+        "ship_window_start",
+        "ship_window_end",
+        "derived_shipping_date",
+        "shipping_date_source",
+        "shipping_date_status"
+    ];
+
+    public static void Enrich(JsonObject order, JsonArray products)
+    {
+        ApplyChannelDisplayName(order);
+        ApplyDerivedShippingWindow(order, products);
+    }
+
+    private static void ApplyChannelDisplayName(JsonObject order)
+    {
+        var sourceKey = GetString(order, "source_key");
+        var displayName = sourceKey?.ToLowerInvariant() switch
+        {
+            "shopee" => "蝦皮賣場",
+            _ => null
+        };
+        if (displayName is null)
+        {
+            return;
+        }
+
+        var sourceProperty = FindKey(order, "source");
+        var originalSource = sourceProperty is null ? null : GetString(order, sourceProperty);
+        if (!string.IsNullOrWhiteSpace(originalSource))
+        {
+            SetValue(order, "shop_name", originalSource);
+        }
+
+        SetValue(order, "source", displayName);
+    }
+
+    private static void ApplyDerivedShippingWindow(JsonObject order, JsonArray products)
+    {
+        foreach (var field in ApplicationOwnedShippingFields)
+        {
+            RemoveValue(order, field);
+        }
+
+        var fallbackYear = TryReadYear(GetString(order, "order_date"));
+        var candidates = new List<ShippingWindow>();
+        var hasInvalidExplicitWindow = false;
+        var hasMultipleExplicitRanges = false;
+        foreach (var product in products.OfType<JsonObject>())
+        {
+            var name = GetString(product, "name") ?? string.Empty;
+            var spec = GetString(product, "spec") ?? string.Empty;
+            var year = TryReadYear(name) ?? fallbackYear;
+            if (year is null)
+            {
+                continue;
+            }
+
+            var specResult = ParseWindows(spec, year.Value, "product.spec");
+            if (specResult.Status != WindowParseStatus.NotFound)
+            {
+                candidates.AddRange(specResult.Windows);
+                hasInvalidExplicitWindow |= specResult.Status == WindowParseStatus.Invalid;
+                hasMultipleExplicitRanges |= specResult.HasMultipleExplicitRanges;
+                continue;
+            }
+
+            var nameResult = ParseWindows(name, year.Value, "product.name");
+            candidates.AddRange(nameResult.Windows);
+            hasInvalidExplicitWindow |= nameResult.Status == WindowParseStatus.Invalid;
+            hasMultipleExplicitRanges |= nameResult.HasMultipleExplicitRanges;
+        }
+
+        var distinct = candidates
+            .DistinctBy(candidate => (candidate.Start, candidate.End, candidate.Monday))
+            .ToArray();
+        if (hasMultipleExplicitRanges || distinct.Length > 1)
+        {
+            SetValue(order, "shipping_date_status", "conflict");
+            return;
+        }
+
+        if (hasInvalidExplicitWindow)
+        {
+            SetValue(order, "shipping_date_status", "needs_review");
+            return;
+        }
+
+        if (distinct.Length == 0)
+        {
+            return;
+        }
+
+        var selected = distinct[0];
+        SetValue(order, "ship_window_start", selected.Start.ToString("yyyy-MM-dd"));
+        SetValue(order, "ship_window_end", selected.End.ToString("yyyy-MM-dd"));
+        SetValue(order, "derived_shipping_date", selected.Monday.ToString("yyyy-MM-dd"));
+        SetValue(order, "shipping_date_source", selected.Source);
+        SetValue(order, "shipping_date_status", "derived");
+    }
+
+    private static WindowParseResult ParseWindows(
+        string value,
+        int year,
+        string source)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return new WindowParseResult(WindowParseStatus.NotFound, [], false);
+        }
+
+        var matches = MonthDayRangeRegex().Matches(value);
+        if (matches.Count == 0)
+        {
+            return ExplicitRangeIntentRegex().IsMatch(value)
+                ? new WindowParseResult(WindowParseStatus.Invalid, [], false)
+                : new WindowParseResult(WindowParseStatus.NotFound, [], false);
+        }
+
+        var windows = new List<ShippingWindow>(matches.Count);
+        var invalid = false;
+        foreach (Match match in matches)
+        {
+            if (!int.TryParse(match.Groups["m1"].Value, out var startMonth) ||
+                !int.TryParse(match.Groups["d1"].Value, out var startDay) ||
+                !int.TryParse(match.Groups["d2"].Value, out var endDay))
+            {
+                invalid = true;
+                continue;
+            }
+
+            var endMonth = match.Groups["m2"].Success &&
+                           int.TryParse(match.Groups["m2"].Value, out var parsedEndMonth)
+                ? parsedEndMonth
+                : startMonth;
+            DateOnly start;
+            DateOnly end;
+            try
+            {
+                start = new DateOnly(year, startMonth, startDay);
+                var endYear = endMonth < startMonth ? year + 1 : year;
+                end = new DateOnly(endYear, endMonth, endDay);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                invalid = true;
+                continue;
+            }
+
+            var monday = start;
+            while (monday.DayOfWeek != DayOfWeek.Monday && monday <= end)
+            {
+                monday = monday.AddDays(1);
+            }
+
+            if (monday > end || monday.AddDays(7) <= end)
+            {
+                invalid = true;
+                continue;
+            }
+
+            windows.Add(new ShippingWindow(start, end, monday, source));
+        }
+
+        return new WindowParseResult(
+            invalid ? WindowParseStatus.Invalid : WindowParseStatus.Valid,
+            windows,
+            matches.Count > 1);
+    }
+
+    private static int? TryReadYear(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var match = YearRegex().Match(value);
+        return match.Success && int.TryParse(match.Value, out var year) ? year : null;
+    }
+
+    private static string? FindKey(JsonObject obj, string name) =>
+        obj.Select(property => property.Key)
+            .FirstOrDefault(key => key.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    private static string? GetString(JsonObject obj, string name)
+    {
+        var key = FindKey(obj, name);
+        if (key is null || obj[key] is not JsonValue value)
+        {
+            return null;
+        }
+
+        return value.TryGetValue<string>(out var text) ? text : value.ToJsonString().Trim('"');
+    }
+
+    private static void SetValue(JsonObject obj, string name, string value)
+    {
+        var key = FindKey(obj, name) ?? name;
+        obj[key] = value;
+    }
+
+    private static void RemoveValue(JsonObject obj, string name)
+    {
+        var key = FindKey(obj, name);
+        if (key is not null)
+        {
+            obj.Remove(key);
+        }
+    }
+
+    [GeneratedRegex(@"(?<m1>\d{1,2})\s*(?:/|月)\s*(?<d1>\d{1,2})\s*日?\s*(?:-|~|～|－|至)\s*(?:(?<m2>\d{1,2})\s*(?:/|月)\s*)?(?<d2>\d{1,2})\s*日?")]
+    private static partial Regex MonthDayRangeRegex();
+
+    [GeneratedRegex(@"(?<!\d)20\d{2}(?!\d)")]
+    private static partial Regex YearRegex();
+
+    [GeneratedRegex(@"(?<!\d)\d{1,2}\s*(?:/|月)\s*\d{1,2}\s*日?\s*(?:-|~|～|－|至)")]
+    private static partial Regex ExplicitRangeIntentRegex();
+
+    private readonly record struct ShippingWindow(DateOnly Start, DateOnly End, DateOnly Monday, string Source);
+
+    private sealed record WindowParseResult(
+        WindowParseStatus Status,
+        IReadOnlyList<ShippingWindow> Windows,
+        bool HasMultipleExplicitRanges);
+
+    private enum WindowParseStatus
+    {
+        NotFound,
+        Valid,
+        Invalid
+    }
+}

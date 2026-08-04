@@ -1,0 +1,14 @@
+# Build output
+build/
+**/bin/
+**/obj/
+
+# IDE and user-local files
+.vs/
+*.user
+*.suo
+
+# Local test and diagnostic artifacts
+TestResults/
+*.log
+*.tmp
