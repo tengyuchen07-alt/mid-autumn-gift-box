@@ -66,6 +66,7 @@ public sealed class OrderSnapshotStore
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceCode);
         ArgumentNullException.ThrowIfNull(rows);
         var replacement = ExpandRows(sourceCode, rows, synchronizedAt);
+        EnsureUniqueKeys(replacement);
 
         await _fileLock.WaitAsync(cancellationToken);
         try
@@ -173,6 +174,20 @@ public sealed class OrderSnapshotStore
         return result;
     }
 
+    private static void EnsureUniqueKeys(IReadOnlyList<OrderLineSnapshot> lines)
+    {
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in lines)
+        {
+            var key = $"{line.SourceCode}\u001f{line.ExternalOrderNo}\u001f{line.ExternalLineKey}";
+            if (!keys.Add(key))
+            {
+                throw new InvalidDataException(
+                    $"訂單 {line.ExternalOrderNo} 包含重複商品列鍵，未提交本次同步。");
+            }
+        }
+    }
+
     private static OrderLineSnapshot CreateLine(
         string sourceCode,
         string orderNo,
@@ -196,8 +211,8 @@ public sealed class OrderSnapshotStore
             GetScalarText(product, "item_no"),
             GetScalarText(product, "name"),
             GetScalarText(product, "spec"),
-            GetDecimal(product, "qty"),
-            GetDecimal(product, "shipp_qty"),
+            GetDecimal(product, "qty", "商品數量"),
+            GetDecimal(product, "shipp_qty", "已出貨數量"),
             GetRowValue(row, "status_code"),
             synchronizedAt);
 
@@ -277,9 +292,10 @@ public sealed class OrderSnapshotStore
         return value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
     }
 
-    private static decimal GetDecimal(JsonElement element, string name)
+    private static decimal GetDecimal(JsonElement element, string name, string displayName)
     {
-        if (!TryGetProperty(element, name, out var value))
+        if (!TryGetProperty(element, name, out var value) ||
+            value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
         {
             return 0m;
         }
@@ -289,10 +305,13 @@ public sealed class OrderSnapshotStore
             return number;
         }
 
-        return value.ValueKind == JsonValueKind.String &&
-               decimal.TryParse(value.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out number)
-            ? number
-            : 0m;
+        if (value.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(value.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out number))
+        {
+            return number;
+        }
+
+        throw new InvalidDataException($"{displayName}格式無效，未提交本次同步。");
     }
 
     private static bool TryGetProperty(JsonElement element, string name, out JsonElement value)

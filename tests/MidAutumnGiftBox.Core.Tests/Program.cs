@@ -26,6 +26,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("同步失敗會保留該來源先前的最後成功時間", SyncFailurePreservesLastSuccessfulRun),
     ("同步查詢日期固定使用台北時區", SyncQueryDateUsesTaipeiTimeZone),
     ("來源訂單快照重跑會更新商品且不影響另一來源", OrderSnapshotReplacesOneSourceWithoutDuplicates),
+    ("訂單快照遇到重複唯一鍵會拒絕整批資料", OrderSnapshotRejectsDuplicateUniqueKeys),
+    ("訂單快照遇到無效數量會保留舊資料", OrderSnapshotRejectsInvalidQuantities),
 };
 
 var failed = 0;
@@ -965,6 +967,11 @@ static async Task OrderSnapshotReplacesOneSourceWithoutDuplicates()
     {
         await store.ReplaceSourceAsync("site1", site1Rows, synchronizedAt);
         await store.ReplaceSourceAsync("site2", site2Rows, synchronizedAt);
+        var initialSnapshot = await store.GetAllAsync();
+        Equal(3, initialSnapshot.Count, "Parent and nested item lines were not both expanded.");
+        var nestedItem = initialSnapshot.Single(line => line.SourceCode == "site1" && line.LineLevel == "item");
+        Equal("4710964232565", nestedItem.Sku, "The nested target SKU was not persisted.");
+        Equal("parent:item_no:P01:1", nestedItem.ParentLineKey, "The nested item lost its parent line key.");
 
         var updatedSite1Rows = new IReadOnlyDictionary<string, string?>[]
         {
@@ -987,6 +994,78 @@ static async Task OrderSnapshotReplacesOneSourceWithoutDuplicates()
         Equal(3m, site1.Quantity, "The repeated site1 sync did not update quantity.");
         Equal(1m, site1.ShippedQuantity, "The repeated site1 sync did not update shipped quantity.");
         Equal("4710964232411", site2.Sku, "Replacing site1 incorrectly changed site2.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static async Task OrderSnapshotRejectsDuplicateUniqueKeys()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-duplicate-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "order-snapshot.json");
+    var store = new OrderSnapshotStore(path);
+    IReadOnlyDictionary<string, string?> Row(string quantity) => new Dictionary<string, string?>
+    {
+        ["order_no"] = "DUP-001",
+        ["status_code"] = "F",
+        ["products"] = $"[{{\"sku\":\"4710964232411\",\"qty\":{quantity}}}]"
+    };
+
+    try
+    {
+        await store.ReplaceSourceAsync("site1", [Row("1")], DateTimeOffset.UtcNow);
+        try
+        {
+            await store.ReplaceSourceAsync("site1", [Row("2"), Row("3")], DateTimeOffset.UtcNow);
+            throw new InvalidOperationException("Expected duplicate unique keys to reject the snapshot.");
+        }
+        catch (InvalidDataException exception)
+        {
+            Contains("重複", exception.Message, "Duplicate-key failure should be understandable.");
+        }
+
+        var snapshot = await store.GetAllAsync();
+        Equal(1, snapshot.Count, "A rejected duplicate snapshot changed the committed data.");
+        Equal(1m, snapshot[0].Quantity, "A rejected duplicate snapshot replaced the prior quantity.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static async Task OrderSnapshotRejectsInvalidQuantities()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-quantity-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "order-snapshot.json");
+    var store = new OrderSnapshotStore(path);
+    IReadOnlyDictionary<string, string?> Row(string products) => new Dictionary<string, string?>
+    {
+        ["order_no"] = "QTY-001",
+        ["products"] = products
+    };
+
+    try
+    {
+        await store.ReplaceSourceAsync("site1",
+            [Row("""[{"sku":"4710964232411","qty":2,"shipp_qty":1}]""")],
+            DateTimeOffset.UtcNow);
+        try
+        {
+            await store.ReplaceSourceAsync("site1",
+                [Row("""[{"sku":"4710964232411","qty":"不是數字","shipp_qty":1}]""")],
+                DateTimeOffset.UtcNow);
+            throw new InvalidOperationException("Expected invalid quantity to reject the snapshot.");
+        }
+        catch (InvalidDataException exception)
+        {
+            Contains("數量", exception.Message, "Invalid-quantity failure should be understandable.");
+        }
+
+        var snapshot = await store.GetAllAsync();
+        Equal(2m, snapshot.Single().Quantity, "An invalid quantity replaced the committed snapshot.");
     }
     finally
     {
