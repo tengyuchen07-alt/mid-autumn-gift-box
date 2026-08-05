@@ -35,6 +35,29 @@ public sealed class SourceSyncFileLock : IDisposable
         }
     }
 
+    public static async Task<SourceSyncFileLock> AcquireAsync(
+        string lockDirectory,
+        string sourceCode,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var acquired = TryAcquire(lockDirectory, sourceCode);
+            if (acquired is not null)
+            {
+                return acquired;
+            }
+
+            await Task.Delay(50, cancellationToken);
+        }
+        while (DateTimeOffset.UtcNow < deadline);
+
+        throw new IOException("本機資料檔正由另一個程序更新，請稍後再試。");
+    }
+
     public void Dispose()
     {
         Interlocked.Exchange(ref _stream, null)?.Dispose();

@@ -24,21 +24,9 @@ public static class SyncWindowPolicy
 {
     public static SyncWindow Create(DateTimeOffset? lastSuccessAt, DateTimeOffset startedAt)
     {
+        _ = lastSuccessAt;
         var throughDate = WmsQueryPolicy.GetTaipeiDate(startedAt);
-        var fromDate = lastSuccessAt is null
-            ? WmsQueryPolicy.InitialOrderDate
-            : WmsQueryPolicy.GetTaipeiDate(lastSuccessAt.Value);
-        if (fromDate < WmsQueryPolicy.InitialOrderDate)
-        {
-            fromDate = WmsQueryPolicy.InitialOrderDate;
-        }
-
-        if (fromDate > throughDate)
-        {
-            fromDate = throughDate;
-        }
-
-        return new SyncWindow(fromDate, throughDate, startedAt);
+        return new SyncWindow(WmsQueryPolicy.InitialOrderDate, throughDate, startedAt);
     }
 }
 

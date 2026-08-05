@@ -62,6 +62,10 @@ public sealed class SyncStatusStore
         await _fileLock.WaitAsync(cancellationToken);
         try
         {
+            var directory = Path.GetDirectoryName(_path)
+                ?? throw new InvalidOperationException("同步狀態檔案缺少目錄。");
+            using var dataLock = await SourceSyncFileLock.AcquireAsync(
+                directory, "sync-status-data", TimeSpan.FromSeconds(10), cancellationToken);
             var statuses = await LoadAsync(cancellationToken);
             return statuses.TryGetValue(sourceCode, out var status) ? status : null;
         }
@@ -159,7 +163,7 @@ public sealed class SyncStatusStore
         var directory = Path.GetDirectoryName(_path)
             ?? throw new InvalidOperationException("同步狀態檔案缺少目錄。");
         Directory.CreateDirectory(directory);
-        var temporaryPath = _path + ".tmp";
+        var temporaryPath = _path + $".{Guid.NewGuid():N}.tmp";
         try
         {
             await using (var stream = new FileStream(

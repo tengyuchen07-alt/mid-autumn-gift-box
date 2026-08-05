@@ -79,6 +79,7 @@ public sealed class OrderSnapshotStore
         await _fileLock.WaitAsync(cancellationToken);
         try
         {
+            using var dataLock = await AcquireDataFileLockAsync(cancellationToken);
             var existing = await LoadAsync(cancellationToken);
             var combined = existing
                 .Where(line => !line.SourceCode.Equals(sourceCode, StringComparison.OrdinalIgnoreCase))
@@ -125,6 +126,7 @@ public sealed class OrderSnapshotStore
         await _fileLock.WaitAsync(cancellationToken);
         try
         {
+            using var dataLock = await AcquireDataFileLockAsync(cancellationToken);
             var existing = await LoadAsync(cancellationToken);
             var retained = new List<OrderLineSnapshot>(existing.Count);
             foreach (var line in existing)
@@ -330,7 +332,7 @@ public sealed class OrderSnapshotStore
         var directory = Path.GetDirectoryName(_path)
             ?? throw new InvalidOperationException("訂單快照檔案缺少目錄。");
         Directory.CreateDirectory(directory);
-        var temporaryPath = _path + ".tmp";
+        var temporaryPath = _path + $".{Guid.NewGuid():N}.tmp";
         try
         {
             await using (var stream = new FileStream(
@@ -348,6 +350,14 @@ public sealed class OrderSnapshotStore
                 File.Delete(temporaryPath);
             }
         }
+    }
+
+    private Task<SourceSyncFileLock> AcquireDataFileLockAsync(CancellationToken cancellationToken)
+    {
+        var directory = Path.GetDirectoryName(_path)
+            ?? throw new InvalidOperationException("訂單快照檔案缺少目錄。");
+        return SourceSyncFileLock.AcquireAsync(
+            directory, "order-snapshot-data", TimeSpan.FromSeconds(10), cancellationToken);
     }
 
     private static (string Key, string? Value) GetIdentity(JsonElement product, int index)

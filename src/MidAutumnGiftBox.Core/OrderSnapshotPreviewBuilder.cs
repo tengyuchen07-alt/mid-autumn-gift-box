@@ -41,6 +41,15 @@ public static class OrderSnapshotPreviewBuilder
                 throw new InvalidDataException($"訂單 {orderGroup.Key} 的快照只有子商品，無法重建預覽。");
             }
 
+            var parentKeys = parentLines
+                .Select(line => line.ExternalLineKey)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (itemLines.Any(line => string.IsNullOrWhiteSpace(line.ParentLineKey) ||
+                                      !parentKeys.Contains(line.ParentLineKey)))
+            {
+                throw new InvalidDataException($"訂單 {orderGroup.Key} 包含找不到父商品的子商品，無法重建預覽。");
+            }
+
             var representative = parentLines.FirstOrDefault() ?? orderGroup.First();
             var products = new JsonArray();
             foreach (var parent in parentLines)
@@ -93,9 +102,11 @@ public static class OrderSnapshotPreviewBuilder
             safeRows.Add(safeRow);
         }
 
-        var testedAt = syncStatus?.FinishedAt ??
-                       sourceLines.Select(line => line.SynchronizedAt).DefaultIfEmpty(DateTimeOffset.Now).Max();
-        var resultOk = syncStatus?.Status != "failed";
+        var testedAt = sourceLines
+            .Select(line => line.SynchronizedAt)
+            .DefaultIfEmpty(syncStatus?.LastSuccessAt ?? DateTimeOffset.Now)
+            .Max();
+        const bool resultOk = true;
         var message = rows.Count == 0 ? "本機尚無已提交訂單快照。" : "已從本機已提交快照載入。";
         var safeEnvelope = new JsonObject
         {
@@ -113,7 +124,7 @@ public static class OrderSnapshotPreviewBuilder
                 "/api_v1/order/order_query.php",
                 testedAt,
                 resultOk ? 200 : 0,
-                syncStatus?.PageCount ?? 0,
+                syncStatus?.Status == "success" ? syncStatus.PageCount : 0,
                 rows.Count,
                 resultOk,
                 message));

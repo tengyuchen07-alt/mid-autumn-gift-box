@@ -238,6 +238,12 @@ internal sealed class MainForm : Form
         }
 
         var display = await _credentialManager.GetDisplayStatusAsync(source.Code);
+        if (_sourceBox.SelectedItem is not WmsSource selected ||
+            !selected.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         _apiIdBox.Text = display.ApiId;
         _apiKeyBox.Clear();
         _savedStateLabel.Text = display.HasSavedKey
@@ -311,10 +317,8 @@ internal sealed class MainForm : Form
                 }
 
                 var finishedAt = DateTimeOffset.Now;
-                await _orderSnapshotStore.ReplaceSourceRangeAsync(
+                await _orderSnapshotStore.ReplaceSourceAsync(
                     source.Code,
-                    window.FromDate,
-                    window.ThroughDate,
                     result.Rows,
                     finishedAt);
                 try
@@ -382,6 +386,12 @@ internal sealed class MainForm : Form
         catch (Exception exception) when (IsSyncStatusStorageError(exception))
         {
             ShowSyncStatusStorageError("本機同步摘要無法讀取。", exception);
+            return;
+        }
+
+        if (_sourceBox.SelectedItem is not WmsSource selected ||
+            !selected.Code.Equals(sourceCode, StringComparison.OrdinalIgnoreCase))
+        {
             return;
         }
 

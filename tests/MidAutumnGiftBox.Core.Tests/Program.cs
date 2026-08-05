@@ -29,10 +29,12 @@ var tests = new (string Name, Func<Task> Run)[]
     ("訂單快照遇到重複唯一鍵會拒絕整批資料", OrderSnapshotRejectsDuplicateUniqueKeys),
     ("訂單快照遇到無效數量會保留舊資料", OrderSnapshotRejectsInvalidQuantities),
     ("已提交快照會重建相同的畫面與 Excel 父子商品", CommittedSnapshotBuildsPreviewAndExcel),
-    ("同步範圍會從最後成功的台北日期包含式重抓", SyncWindowIncludesLastSuccessfulTaipeiDate),
+    ("同步 checkpoint 不會縮短待處理訂單的完整成立日範圍", SyncWindowKeepsFullOrderDateRange),
     ("增量快照只取代來源的訂單成立日範圍", IncrementalSnapshotReplacesOnlyQueriedOrderDates),
     ("增量訂單 API 會送出明確的成立日起訖", ExplicitOrderRangeIsSentToWms),
     ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
+    ("最近同步失敗不會把最後提交快照標成失敗資料", FailedSyncKeepsCommittedPreviewValid),
+    ("快照投影遇到孤立子商品會拒絕顯示", SnapshotPreviewRejectsOrphanItems),
 };
 
 var failed = 0;
@@ -1122,7 +1124,7 @@ static Task CommittedSnapshotBuildsPreviewAndExcel()
     return Task.CompletedTask;
 }
 
-static Task SyncWindowIncludesLastSuccessfulTaipeiDate()
+static Task SyncWindowKeepsFullOrderDateRange()
 {
     var startedAt = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
     var first = SyncWindowPolicy.Create(null, startedAt);
@@ -1130,10 +1132,10 @@ static Task SyncWindowIncludesLastSuccessfulTaipeiDate()
     Equal(new DateOnly(2026, 8, 5), first.ThroughDate, "Sync upper date should be fixed at run start.");
 
     var lastSuccess = new DateTimeOffset(2026, 8, 4, 16, 30, 0, TimeSpan.Zero);
-    var incremental = SyncWindowPolicy.Create(lastSuccess, startedAt);
-    Equal(new DateOnly(2026, 8, 5), incremental.FromDate,
-        "The last successful instant should be converted to its Taipei date inclusively.");
-    Equal(startedAt, incremental.StartedAt, "The run start instant should remain fixed.");
+    var refresh = SyncWindowPolicy.Create(lastSuccess, startedAt);
+    Equal(new DateOnly(2026, 7, 1), refresh.FromDate,
+        "Last success must not hide older orders whose pending status may have changed.");
+    Equal(startedAt, refresh.StartedAt, "The run start instant should remain fixed.");
     return Task.CompletedTask;
 }
 
@@ -1226,6 +1228,53 @@ static Task SourceSyncLockIsExclusive()
     finally
     {
         if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task FailedSyncKeepsCommittedPreviewValid()
+{
+    var synchronizedAt = new DateTimeOffset(2026, 8, 4, 9, 0, 0, TimeSpan.FromHours(8));
+    var lines = new[]
+    {
+        new OrderLineSnapshot("site1", "R001", "parent:sku:BOX:1", "parent", null,
+            "shopee", "店舖", "2026/08/04 08:00:00", null, null,
+            "BOX", null, "蛋黃酥禮盒", null, 1m, 0m, "F", synchronizedAt)
+    };
+    var failedAt = synchronizedAt.AddDays(1);
+    var failedStatus = new SyncSourceStatus(
+        "site1", "網站1", new DateOnly(2026, 7, 1), new DateOnly(2026, 8, 5),
+        "failed", failedAt.AddMinutes(-1), failedAt, 0, 0, synchronizedAt, "網路失敗");
+
+    var preview = OrderSnapshotPreviewBuilder.Build(
+        new WmsSource("site1", "網站1", new Uri("https://example.test")), lines, failedStatus);
+    True(preview.IsSuccess, "A committed snapshot should remain valid after a later sync failure.");
+    True(preview.Metadata.ResultOk, "Snapshot metadata should describe the committed data, not the failed run.");
+    Equal(synchronizedAt, preview.Metadata.TestedAt, "Snapshot time should come from committed data.");
+    return Task.CompletedTask;
+}
+
+static Task SnapshotPreviewRejectsOrphanItems()
+{
+    var synchronizedAt = DateTimeOffset.UtcNow;
+    var lines = new OrderLineSnapshot[]
+    {
+        new("site1", "R001", "parent:sku:BOX:1", "parent", null,
+            "shopee", null, "2026/08/04", null, null, "BOX", null, "禮盒", null, 1m, 0m, "F", synchronizedAt),
+        new("site1", "R001", "item:missing:sku:ITEM:1", "item", "parent:sku:MISSING:1",
+            "shopee", null, "2026/08/04", null, null, "ITEM", null, "子商品", null, 1m, 0m, "F", synchronizedAt)
+    };
+
+    try
+    {
+        OrderSnapshotPreviewBuilder.Build(
+            new WmsSource("site1", "網站1", new Uri("https://example.test")), lines, null);
+        throw new InvalidOperationException("Expected orphan snapshot item to be rejected.");
+    }
+    catch (InvalidDataException exception)
+    {
+        Contains("子商品", exception.Message, "Orphan-item failure should be understandable.");
     }
 
     return Task.CompletedTask;
