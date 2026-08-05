@@ -94,7 +94,7 @@ public static partial class OrderPreviewEnricher
         }
 
         var distinct = candidates
-            .DistinctBy(candidate => (candidate.Start, candidate.End, candidate.Monday))
+            .DistinctBy(candidate => (candidate.Start, candidate.End, candidate.ShippingDate))
             .ToArray();
         if (hasMultipleExplicitRanges || distinct.Length > 1)
         {
@@ -116,7 +116,7 @@ public static partial class OrderPreviewEnricher
         var selected = distinct[0];
         SetValue(product, "ship_window_start", selected.Start.ToString("yyyy-MM-dd"));
         SetValue(product, "ship_window_end", selected.End.ToString("yyyy-MM-dd"));
-        SetValue(product, "derived_shipping_date", selected.Monday.ToString("yyyy-MM-dd"));
+        SetValue(product, "derived_shipping_date", selected.ShippingDate.ToString("yyyy-MM-dd"));
         SetValue(product, "shipping_date_source", selected.Source);
         SetValue(product, "shipping_date_status", "derived");
     }
@@ -201,24 +201,34 @@ public static partial class OrderPreviewEnricher
                 continue;
             }
 
-            var monday = start;
-            while (monday.DayOfWeek != DayOfWeek.Monday && monday <= end)
+            var shippingDate = start;
+            while (shippingDate.DayOfWeek != DayOfWeek.Monday && shippingDate <= end)
             {
-                monday = monday.AddDays(1);
+                shippingDate = shippingDate.AddDays(1);
             }
 
-            if (monday > end)
+            if (shippingDate > end)
             {
-                var daysSinceMonday = ((int)start.DayOfWeek + 6) % 7;
-                monday = start.AddDays(-daysSinceMonday);
+                shippingDate = start;
+                while (shippingDate <= end &&
+                       shippingDate.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+                {
+                    shippingDate = shippingDate.AddDays(1);
+                }
+
+                if (shippingDate > end)
+                {
+                    invalid = true;
+                    continue;
+                }
             }
-            else if (monday.AddDays(7) <= end)
+            else if (shippingDate.AddDays(7) <= end)
             {
                 invalid = true;
                 continue;
             }
 
-            windows.Add(new ShippingWindow(start, end, monday, source));
+            windows.Add(new ShippingWindow(start, end, shippingDate, source));
         }
 
         return new WindowParseResult(
@@ -277,7 +287,11 @@ public static partial class OrderPreviewEnricher
     [GeneratedRegex(@"(?<!\d)\d{1,2}\s*(?:/|月)\s*\d{1,2}\s*日?\s*(?:-|~|～|－|至)")]
     private static partial Regex ExplicitRangeIntentRegex();
 
-    private readonly record struct ShippingWindow(DateOnly Start, DateOnly End, DateOnly Monday, string Source);
+    private readonly record struct ShippingWindow(
+        DateOnly Start,
+        DateOnly End,
+        DateOnly ShippingDate,
+        string Source);
 
     private sealed record WindowParseResult(
         WindowParseStatus Status,
