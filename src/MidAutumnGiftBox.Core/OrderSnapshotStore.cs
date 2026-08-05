@@ -212,7 +212,7 @@ public sealed class OrderSnapshotStore
                     var parentOccurrence = NextOccurrence(parentOccurrences, parentIdentity.Key);
                     var parentLineKey = $"parent:{parentIdentity.Key}:{parentOccurrence}";
                     result.Add(CreateLine(
-                        sourceCode, orderNo, parentLineKey, "parent", null, row, product, synchronizedAt));
+                        sourceCode, orderNo, parentLineKey, "parent", null, row, product, product, synchronizedAt));
 
                     if (!TryGetProperty(product, "items", out var items) ||
                         items.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
@@ -239,7 +239,7 @@ public sealed class OrderSnapshotStore
                         var itemOccurrence = NextOccurrence(itemOccurrences, itemIdentity.Key);
                         var itemLineKey = $"item:{parentLineKey}:{itemIdentity.Key}:{itemOccurrence}";
                         result.Add(CreateLine(
-                            sourceCode, orderNo, itemLineKey, "item", parentLineKey, row, item, synchronizedAt));
+                            sourceCode, orderNo, itemLineKey, "item", parentLineKey, row, item, product, synchronizedAt));
                     }
                 }
             }
@@ -286,6 +286,7 @@ public sealed class OrderSnapshotStore
         string? parentLineKey,
         IReadOnlyDictionary<string, string?> row,
         JsonElement product,
+        JsonElement shippingProduct,
         DateTimeOffset synchronizedAt) => new(
             sourceCode,
             orderNo,
@@ -296,7 +297,7 @@ public sealed class OrderSnapshotStore
             GetRowValue(row, "shop_name"),
             GetRowValue(row, "order_date"),
             GetRowValue(row, "arrival_date"),
-            GetRowValue(row, "derived_shipping_date"),
+            GetProductOrRowValue(shippingProduct, row, "derived_shipping_date"),
             GetScalarText(product, "sku"),
             GetScalarText(product, "item_no"),
             GetScalarText(product, "name"),
@@ -306,10 +307,10 @@ public sealed class OrderSnapshotStore
             GetRowValue(row, "status_code"),
             synchronizedAt,
             GetRowValue(row, "source"),
-            GetRowValue(row, "ship_window_start"),
-            GetRowValue(row, "ship_window_end"),
-            GetRowValue(row, "shipping_date_source"),
-            GetRowValue(row, "shipping_date_status"),
+            GetProductOrRowValue(shippingProduct, row, "ship_window_start"),
+            GetProductOrRowValue(shippingProduct, row, "ship_window_end"),
+            GetProductOrRowValue(shippingProduct, row, "shipping_date_source"),
+            GetProductOrRowValue(shippingProduct, row, "shipping_date_status"),
             GetScalarText(product, "type"),
             GetRowValue(row, "status_name"),
             GetRowValue(row, "total_price"));
@@ -386,6 +387,15 @@ public sealed class OrderSnapshotStore
 
     private static string? GetRowValue(IReadOnlyDictionary<string, string?> row, string name) =>
         row.FirstOrDefault(pair => pair.Key.Equals(name, StringComparison.OrdinalIgnoreCase)).Value;
+
+    private static string? GetProductOrRowValue(
+        JsonElement product,
+        IReadOnlyDictionary<string, string?> row,
+        string name)
+    {
+        var productValue = GetScalarText(product, name);
+        return string.IsNullOrWhiteSpace(productValue) ? GetRowValue(row, name) : productValue;
+    }
 
     private static string? GetScalarText(JsonElement element, string name)
     {

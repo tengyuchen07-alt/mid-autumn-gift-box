@@ -51,32 +51,46 @@ public static partial class OrderPreviewEnricher
         }
 
         var fallbackYear = TryReadYear(GetString(order, "order_date"));
+        var parentProducts = products.OfType<JsonObject>().ToArray();
+        foreach (var product in parentProducts)
+        {
+            ApplyDerivedShippingWindow(product, fallbackYear);
+        }
+
+        MirrorConsistentProductShippingWindow(order, parentProducts);
+    }
+
+    private static void ApplyDerivedShippingWindow(JsonObject product, int? fallbackYear)
+    {
+        foreach (var field in ApplicationOwnedShippingFields)
+        {
+            RemoveValue(product, field);
+        }
+
         var candidates = new List<ShippingWindow>();
         var hasInvalidExplicitWindow = false;
         var hasMultipleExplicitRanges = false;
-        foreach (var product in products.OfType<JsonObject>())
+        var name = GetString(product, "name") ?? string.Empty;
+        var spec = GetString(product, "spec") ?? string.Empty;
+        var year = TryReadYear(name) ?? fallbackYear;
+        if (year is null)
         {
-            var name = GetString(product, "name") ?? string.Empty;
-            var spec = GetString(product, "spec") ?? string.Empty;
-            var year = TryReadYear(name) ?? fallbackYear;
-            if (year is null)
-            {
-                continue;
-            }
+            return;
+        }
 
-            var specResult = ParseWindows(spec, year.Value, "product.spec");
-            if (specResult.Status != WindowParseStatus.NotFound)
-            {
-                candidates.AddRange(specResult.Windows);
-                hasInvalidExplicitWindow |= specResult.Status == WindowParseStatus.Invalid;
-                hasMultipleExplicitRanges |= specResult.HasMultipleExplicitRanges;
-                continue;
-            }
-
+        var specResult = ParseWindows(spec, year.Value, "product.spec");
+        if (specResult.Status != WindowParseStatus.NotFound)
+        {
+            candidates.AddRange(specResult.Windows);
+            hasInvalidExplicitWindow = specResult.Status == WindowParseStatus.Invalid;
+            hasMultipleExplicitRanges = specResult.HasMultipleExplicitRanges;
+        }
+        else
+        {
             var nameResult = ParseWindows(name, year.Value, "product.name");
             candidates.AddRange(nameResult.Windows);
-            hasInvalidExplicitWindow |= nameResult.Status == WindowParseStatus.Invalid;
-            hasMultipleExplicitRanges |= nameResult.HasMultipleExplicitRanges;
+            hasInvalidExplicitWindow = nameResult.Status == WindowParseStatus.Invalid;
+            hasMultipleExplicitRanges = nameResult.HasMultipleExplicitRanges;
         }
 
         var distinct = candidates
@@ -84,13 +98,13 @@ public static partial class OrderPreviewEnricher
             .ToArray();
         if (hasMultipleExplicitRanges || distinct.Length > 1)
         {
-            SetValue(order, "shipping_date_status", "conflict");
+            SetValue(product, "shipping_date_status", "conflict");
             return;
         }
 
         if (hasInvalidExplicitWindow)
         {
-            SetValue(order, "shipping_date_status", "needs_review");
+            SetValue(product, "shipping_date_status", "needs_review");
             return;
         }
 
@@ -100,11 +114,43 @@ public static partial class OrderPreviewEnricher
         }
 
         var selected = distinct[0];
-        SetValue(order, "ship_window_start", selected.Start.ToString("yyyy-MM-dd"));
-        SetValue(order, "ship_window_end", selected.End.ToString("yyyy-MM-dd"));
-        SetValue(order, "derived_shipping_date", selected.Monday.ToString("yyyy-MM-dd"));
-        SetValue(order, "shipping_date_source", selected.Source);
-        SetValue(order, "shipping_date_status", "derived");
+        SetValue(product, "ship_window_start", selected.Start.ToString("yyyy-MM-dd"));
+        SetValue(product, "ship_window_end", selected.End.ToString("yyyy-MM-dd"));
+        SetValue(product, "derived_shipping_date", selected.Monday.ToString("yyyy-MM-dd"));
+        SetValue(product, "shipping_date_source", selected.Source);
+        SetValue(product, "shipping_date_status", "derived");
+    }
+
+    private static void MirrorConsistentProductShippingWindow(
+        JsonObject order,
+        IReadOnlyList<JsonObject> products)
+    {
+        if (products.Count == 0)
+        {
+            return;
+        }
+
+        var signatures = products
+            .Select(product => string.Join(
+                "\u001f",
+                ApplicationOwnedShippingFields.Select(field => GetString(product, field) ?? string.Empty)))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var hasShippingMetadata = ApplicationOwnedShippingFields
+            .Any(field => !string.IsNullOrWhiteSpace(GetString(products[0], field)));
+        if (signatures.Length != 1 || !hasShippingMetadata)
+        {
+            return;
+        }
+
+        foreach (var field in ApplicationOwnedShippingFields)
+        {
+            var value = GetString(products[0], field);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                SetValue(order, field, value);
+            }
+        }
     }
 
     private static WindowParseResult ParseWindows(

@@ -382,8 +382,19 @@ static async Task ShippingDerivationRejectsFuzzyAndConflictingText()
     Equal("原賣場", fuzzy["source"], "Unknown source_key should preserve the original source.");
     True(!fuzzy.ContainsKey("derived_shipping_date"), "Fuzzy month text must not derive an exact date.");
     var conflict = result.Rows.Single(row => row["order_no"] == "CONFLICT");
-    Equal("conflict", conflict["shipping_date_status"], "Conflicting windows should be marked for review.");
-    True(!conflict.ContainsKey("derived_shipping_date"), "Conflicting windows must not choose one date.");
+    True(!conflict.ContainsKey("shipping_date_status"),
+        "Different parent products in one order must not create an order-level conflict.");
+    True(!conflict.ContainsKey("derived_shipping_date"),
+        "An order with multiple parent shipping dates must not expose one order-level date.");
+    using (var conflictProducts = JsonDocument.Parse(conflict["products"]!))
+    {
+        var firstProduct = conflictProducts.RootElement[0];
+        var secondProduct = conflictProducts.RootElement[1];
+        Equal("2026-08-24", firstProduct.GetProperty("derived_shipping_date").GetString(),
+            "The first parent product should keep its own shipping Monday.");
+        Equal("2026-08-31", secondProduct.GetProperty("derived_shipping_date").GetString(),
+            "The second parent product should keep its own shipping Monday.");
+    }
     var ambiguous = result.Rows.Single(row => row["order_no"] == "SPEC-AMBIGUOUS");
     Equal("needs_review", ambiguous["shipping_date_status"], "An explicit non-unique spec should require review.");
     True(!ambiguous.ContainsKey("derived_shipping_date"), "Invalid spec must not fall back to name or retain API-supplied derived data.");
@@ -964,6 +975,8 @@ static async Task OrderSnapshotReplacesOneSourceWithoutDuplicates()
             ["status_code"] = "F",
             ["products"] = """
                 [{"sku":"BOX-001","item_no":"P01","name":"蛋黃酥禮盒","spec":"8/22-8/28當週出貨","qty":1,"shipp_qty":0,
+                  "ship_window_start":"2026-09-05","ship_window_end":"2026-09-11",
+                  "derived_shipping_date":"2026-09-07","shipping_date_source":"product.spec","shipping_date_status":"derived",
                   "items":[{"sku":"4710964232565","item_no":"I01","name":"蛋黃酥9入","qty":9,"shipp_qty":0}]}]
                 """
         }
@@ -988,6 +1001,11 @@ static async Task OrderSnapshotReplacesOneSourceWithoutDuplicates()
         var nestedItem = initialSnapshot.Single(line => line.SourceCode == "site1" && line.LineLevel == "item");
         Equal("4710964232565", nestedItem.Sku, "The nested target SKU was not persisted.");
         Equal("parent:item_no:P01:1", nestedItem.ParentLineKey, "The nested item lost its parent line key.");
+        Equal("2026-09-07", nestedItem.DerivedShippingDate,
+            "A nested item should inherit its parent product shipping date.");
+        var initialParent = initialSnapshot.Single(line => line.SourceCode == "site1" && line.LineLevel == "parent");
+        Equal("2026-09-07", initialParent.DerivedShippingDate,
+            "A parent line should prefer its own shipping date over the order-level fallback.");
 
         var updatedSite1Rows = new IReadOnlyDictionary<string, string?>[]
         {
