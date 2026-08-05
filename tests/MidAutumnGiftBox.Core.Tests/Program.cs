@@ -359,6 +359,16 @@ static async Task ShippingDerivationRejectsFuzzyAndConflictingText()
                 }]
               },
               {
+                "order_no":"WEEKDAY-START",
+                "order_date":"2026/09/15 09:00:00",
+                "status_code":"F",
+                "products":[{
+                  "name":"(預購)【芝初】2026年黑芝麻Q潤蛋黃酥9入禮盒-ECTV",
+                  "spec":"9/15~9/18出貨",
+                  "qty":1
+                }]
+              },
+              {
                 "order_no":"CROSS-YEAR",
                 "order_date":"2026/12/20 09:00:00",
                 "status_code":"F",
@@ -377,7 +387,7 @@ static async Task ShippingDerivationRejectsFuzzyAndConflictingText()
         new ApiCredentials("id", "key"),
         new DateOnly(2026, 8, 4));
 
-    Equal(6, result.Rows.Count, "All egg-yolk pastry orders should remain visible.");
+    Equal(7, result.Rows.Count, "All egg-yolk pastry orders should remain visible.");
     var fuzzy = result.Rows.Single(row => row["order_no"] == "FUZZY");
     Equal("原賣場", fuzzy["source"], "Unknown source_key should preserve the original source.");
     True(!fuzzy.ContainsKey("derived_shipping_date"), "Fuzzy month text must not derive an exact date.");
@@ -405,6 +415,9 @@ static async Task ShippingDerivationRejectsFuzzyAndConflictingText()
     var malformed = result.Rows.Single(row => row["order_no"] == "MALFORMED");
     Equal("needs_review", malformed["shipping_date_status"], "Malformed explicit spec should require review.");
     True(!malformed.ContainsKey("derived_shipping_date"), "Malformed spec must not fall back to a valid range in name.");
+    var weekdayStart = result.Rows.Single(row => row["order_no"] == "WEEKDAY-START");
+    Equal("2026-09-14", weekdayStart["derived_shipping_date"],
+        "A weekday-only range should use the Monday of that shipping week.");
     var crossYear = result.Rows.Single(row => row["order_no"] == "CROSS-YEAR");
     Equal("2026-12-29", crossYear["ship_window_start"], "Cross-year start is incorrect.");
     Equal("2027-01-04", crossYear["ship_window_end"], "Cross-year end is incorrect.");

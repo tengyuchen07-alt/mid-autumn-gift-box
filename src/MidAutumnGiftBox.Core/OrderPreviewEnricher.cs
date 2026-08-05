@@ -207,7 +207,12 @@ public static partial class OrderPreviewEnricher
                 monday = monday.AddDays(1);
             }
 
-            if (monday > end || monday.AddDays(7) <= end)
+            if (monday > end)
+            {
+                var daysSinceMonday = ((int)start.DayOfWeek + 6) % 7;
+                monday = start.AddDays(-daysSinceMonday);
+            }
+            else if (monday.AddDays(7) <= end)
             {
                 invalid = true;
                 continue;
