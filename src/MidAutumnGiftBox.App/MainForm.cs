@@ -604,9 +604,11 @@ internal sealed class MainForm : Form
     private async Task ExportPreviewAsync()
     {
         IReadOnlyList<OrderChangeEntry> changeEntries;
+        IReadOnlyList<OrderLineSnapshot> snapshots;
         try
         {
             changeEntries = await _orderChangeLedgerStore.GetAllAsync();
+            snapshots = await _orderSnapshotStore.GetAllAsync();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
                                           System.Text.Json.JsonException)
@@ -640,7 +642,7 @@ internal sealed class MainForm : Form
 
         try
         {
-            GiftBoxWorkbookExporter.Export(dialog.FileName, changeEntries);
+            GiftBoxWorkbookExporter.Export(dialog.FileName, changeEntries, snapshots);
             _statusLabel.Text = $"Excel 已匯出：{dialog.FileName}";
             MessageBox.Show(this,
                 "Excel 匯出完成。\n包含「三入」、「六入」、「九入」三張工作表，資料已合併兩個網站。\n" +

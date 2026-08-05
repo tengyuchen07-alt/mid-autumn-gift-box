@@ -52,6 +52,33 @@ public static class GiftBoxWorkbookExporter
         }
     }
 
+    public static void Export(
+        string path,
+        IReadOnlyList<OrderChangeEntry> entries,
+        IReadOnlyList<OrderLineSnapshot> snapshots)
+    {
+        ArgumentNullException.ThrowIfNull(entries);
+        ArgumentNullException.ThrowIfNull(snapshots);
+        var snapshotDates = snapshots
+            .Where(snapshot => snapshot.LineLevel.Equals("parent", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(SnapshotLineKey, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group
+                    .OrderByDescending(snapshot => snapshot.SynchronizedAt)
+                    .Select(snapshot => snapshot.DerivedShippingDate ?? snapshot.ArrivalDate)
+                    .FirstOrDefault(),
+                StringComparer.OrdinalIgnoreCase);
+        var resolvedEntries = entries
+            .Select(entry => string.IsNullOrWhiteSpace(entry.DeliveryDate) &&
+                             snapshotDates.TryGetValue(EntryLineKey(entry), out var deliveryDate) &&
+                             !string.IsNullOrWhiteSpace(deliveryDate)
+                ? entry with { DeliveryDate = deliveryDate }
+                : entry)
+            .ToArray();
+        Export(path, resolvedEntries);
+    }
+
     private static IReadOnlyList<OrderChangeEntry> EntriesForSize(
         IReadOnlyList<OrderChangeEntry> entries,
         int size) =>
@@ -175,14 +202,55 @@ public static class GiftBoxWorkbookExporter
         var sheetData = document.Root?.Element(spreadsheet + "sheetData")
             ?? throw new InvalidDataException("中秋禮盒統計工作表格式不完整。");
         var sharedStrings = ReadSharedStrings(archive, spreadsheet);
-        var knownIds = sheetData.Elements(spreadsheet + "row")
-            .Skip(1)
-            .Select(row => row.Elements(spreadsheet + "c")
-                .FirstOrDefault(cell => ((string?)cell.Attribute("r"))?.StartsWith("F", StringComparison.OrdinalIgnoreCase) == true))
-            .Where(cell => cell is not null)
-            .Select(cell => ReadCellText(cell!, spreadsheet, sharedStrings))
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var entriesById = entries
+            .GroupBy(entry => entry.EntryId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var knownIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in sheetData.Elements(spreadsheet + "row").Skip(1))
+        {
+            var idCell = FindCell(row, "F");
+            var entryId = idCell is null ? null : ReadCellText(idCell, spreadsheet, sharedStrings);
+            if (string.IsNullOrWhiteSpace(entryId))
+            {
+                continue;
+            }
+
+            knownIds.Add(entryId);
+            if (!entriesById.TryGetValue(entryId, out var matchingEntry) ||
+                string.IsNullOrWhiteSpace(matchingEntry.DeliveryDate))
+            {
+                continue;
+            }
+
+            var deliveryDateCell = FindCell(row, "C");
+            if (deliveryDateCell is not null &&
+                !IsCellBlank(deliveryDateCell, spreadsheet, sharedStrings))
+            {
+                continue;
+            }
+
+            var rowNumber = (string?)row.Attribute("r")
+                ?? throw new InvalidDataException("Excel row is missing its row number.");
+            if (deliveryDateCell is null)
+            {
+                deliveryDateCell = CreateTextCell($"C{rowNumber}", matchingEntry.DeliveryDate, spreadsheet);
+                var nextCell = row.Elements(spreadsheet + "c")
+                    .FirstOrDefault(cell => ((string?)cell.Attribute("r"))?.StartsWith(
+                        "D", StringComparison.OrdinalIgnoreCase) == true);
+                if (nextCell is null)
+                {
+                    row.Add(deliveryDateCell);
+                }
+                else
+                {
+                    nextCell.AddBeforeSelf(deliveryDateCell);
+                }
+            }
+            else
+            {
+                SetTextCellValue(deliveryDateCell, matchingEntry.DeliveryDate, spreadsheet);
+            }
+        }
         var nextRow = sheetData.Elements(spreadsheet + "row")
             .Select(row => int.TryParse((string?)row.Attribute("r"), out var number) ? number : 0)
             .DefaultIfEmpty(1)
@@ -261,6 +329,29 @@ public static class GiftBoxWorkbookExporter
                 new XElement(spreadsheet + "t",
                     new XAttribute(XNamespace.Xml + "space", "preserve"),
                     RemoveInvalidXmlCharacters(value))));
+
+    private static XElement? FindCell(XElement row, string column) =>
+        row.Elements(XName.Get("c", SpreadsheetNamespace))
+            .FirstOrDefault(cell => ((string?)cell.Attribute("r"))?.StartsWith(
+                column, StringComparison.OrdinalIgnoreCase) == true);
+
+    private static bool IsCellBlank(
+        XElement cell,
+        XNamespace spreadsheet,
+        IReadOnlyList<string> sharedStrings) =>
+        string.IsNullOrWhiteSpace(ReadCellText(cell, spreadsheet, sharedStrings)) &&
+        string.IsNullOrWhiteSpace(cell.Element(spreadsheet + "v")?.Value) &&
+        cell.Element(spreadsheet + "f") is null;
+
+    private static void SetTextCellValue(XElement cell, string value, XNamespace spreadsheet)
+    {
+        cell.SetAttributeValue("t", "inlineStr");
+        cell.RemoveNodes();
+        cell.Add(new XElement(spreadsheet + "is",
+            new XElement(spreadsheet + "t",
+                new XAttribute(XNamespace.Xml + "space", "preserve"),
+                RemoveInvalidXmlCharacters(value))));
+    }
 
     private static void WriteTextCell(XmlWriter writer, string reference, string value)
     {
@@ -346,6 +437,12 @@ public static class GiftBoxWorkbookExporter
 
         return result;
     }
+
+    private static string EntryLineKey(OrderChangeEntry entry) =>
+        $"{entry.SourceCode}\u001f{entry.ExternalOrderNo}\u001f{entry.ExternalLineKey}";
+
+    private static string SnapshotLineKey(OrderLineSnapshot snapshot) =>
+        $"{snapshot.SourceCode}\u001f{snapshot.ExternalOrderNo}\u001f{snapshot.ExternalLineKey}";
 
     private static void WriteTextEntry(ZipArchive archive, string path, string content)
     {

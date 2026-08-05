@@ -40,6 +40,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Excel 追加新異動時會保留人工確認欄", ExcelAppendPreservesManualConfirmation),
     ("兩網站禮盒會依三六九入輸出且數量為 Excel 數字", ThreeGiftBoxSheetsCombineSourcesAndUseNumericQuantities),
     ("三種禮盒 Excel 追加時保留確認且不重複", ThreeGiftBoxWorkbookAppendPreservesConfirmation),
+    ("Excel 只回填空白日期且保留人工確認與歷史欄位", GiftBoxWorkbookBackfillsBlankDatesFromSnapshot),
     ("舊異動名稱依蛋黃酥入數分流且不誤用芝麻粉倍數", GiftBoxSizeUsesEggYolkCountNotOtherMultipliers),
     ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
     ("最近同步失敗不會把最後提交快照標成失敗資料", FailedSyncKeepsCommittedPreviewValid),
@@ -1567,6 +1568,73 @@ static Task ThreeGiftBoxWorkbookAppendPreservesConfirmation()
             .Element(ns + "v")?.Value, "Appended negative quantity is not numeric.");
         Equal(1, result.ToString().Split("ID-1", StringSplitOptions.None).Length - 1,
             "Existing row was duplicated during append.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task GiftBoxWorkbookBackfillsBlankDatesFromSnapshot()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-date-backfill-{Guid.NewGuid():N}.xlsx");
+    var at = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    OrderChangeEntry Entry(string id, string orderNo, string? deliveryDate) =>
+        new(id, at, "site1", "網站1：睿驛", orderNo, "parent:A", "蝦皮賣場",
+            "2026/08/04 08:00:00", deliveryDate, "4710964232435", "蛋黃酥3入禮盒",
+            0m, 2m, 2m, "新增", "F", "待處理", false, string.Empty);
+    OrderLineSnapshot Snapshot(string orderNo, string deliveryDate) =>
+        new("site1", orderNo, "parent:A", "parent", null, "shopee", null,
+            "2026/08/04 08:00:00", null, deliveryDate, "4710964232435", null,
+            "蛋黃酥3入禮盒", null, 2m, 0m, "F", at.AddHours(1));
+
+    try
+    {
+        var blankDate = Entry("BACKFILL-1", "ORDER-1", null);
+        var existingDate = Entry("BACKFILL-2", "ORDER-2", "2026-08-10");
+        GiftBoxWorkbookExporter.Export(path, [blankDate, existingDate]);
+
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            var sheet = archive.GetEntry("xl/worksheets/sheet1.xml")
+                ?? throw new InvalidOperationException("Three-piece worksheet is missing.");
+            XDocument document;
+            using (var input = sheet.Open()) document = XDocument.Load(input);
+            XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            document.Descendants(spreadsheet + "c")
+                .Single(cell => (string?)cell.Attribute("r") == "E2")
+                .Descendants(spreadsheet + "t").Single().Value = "已確認";
+            sheet.Delete();
+            var replacement = archive.CreateEntry("xl/worksheets/sheet1.xml");
+            using var output = replacement.Open();
+            document.Save(output);
+        }
+
+        GiftBoxWorkbookExporter.Export(
+            path,
+            [blankDate, existingDate],
+            [Snapshot("ORDER-1", "2026-08-24"), Snapshot("ORDER-2", "2026-09-14")]);
+
+        using var resultArchive = ZipFile.OpenRead(path);
+        using var stream = (resultArchive.GetEntry("xl/worksheets/sheet1.xml")
+                            ?? throw new InvalidOperationException("Three-piece worksheet is missing after backfill.")).Open();
+        var result = XDocument.Load(stream);
+        XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        string Text(string reference) => result.Descendants(ns + "c")
+            .Single(cell => (string?)cell.Attribute("r") == reference)
+            .Descendants(ns + "t").Single().Value;
+        Equal("2026-08-24", Text("C2"), "Blank delivery date was not backfilled from the matching snapshot line.");
+        Equal("2026-08-10", Text("C3"), "A nonblank delivery date must not be overwritten.");
+        Equal("已確認", Text("E2"), "Manual confirmation was overwritten while backfilling a date.");
+        Equal("ORDER-1", Text("B2"), "Order number changed while backfilling a date.");
+        Equal("2", result.Descendants(ns + "c").Single(cell => (string?)cell.Attribute("r") == "D2")
+            .Element(ns + "v")?.Value, "Quantity changed while backfilling a date.");
+        Equal("BACKFILL-1", Text("F2"), "Entry ID changed while backfilling a date.");
+        Equal(1, result.ToString().Split("BACKFILL-1", StringSplitOptions.None).Length - 1,
+            "Backfilling duplicated an existing Excel row.");
+        Equal(null, blankDate.DeliveryDate, "Backfilling Excel must not mutate the append-only ledger entry.");
     }
     finally
     {
