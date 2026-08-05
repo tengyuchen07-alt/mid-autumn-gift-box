@@ -36,18 +36,36 @@ public sealed class WmsApiClient
             cancellationToken);
     }
 
-    public async Task<PreviewResult> GetPendingOrdersSinceInitialDateAsync(
+    public Task<PreviewResult> GetPendingOrdersSinceInitialDateAsync(
         WmsSource source,
         ApiCredentials credentials,
+        DateOnly throughDate,
+        CancellationToken cancellationToken = default) =>
+        GetPendingOrdersAsync(
+            source,
+            credentials,
+            WmsQueryPolicy.InitialOrderDate,
+            throughDate,
+            cancellationToken);
+
+    public async Task<PreviewResult> GetPendingOrdersAsync(
+        WmsSource source,
+        ApiCredentials credentials,
+        DateOnly fromDate,
         DateOnly throughDate,
         CancellationToken cancellationToken = default)
     {
         var isFlavor = FlavorProductPolicy.AppliesTo(source);
-        if (throughDate < WmsQueryPolicy.InitialOrderDate)
+        if (fromDate < WmsQueryPolicy.InitialOrderDate)
         {
             throw new ArgumentException(
-                $"查詢結束日不可早於 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd}。",
-                nameof(throughDate));
+                $"查詢起日不可早於 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd}。",
+                nameof(fromDate));
+        }
+
+        if (throughDate < fromDate)
+        {
+            throw new ArgumentException("查詢結束日不可早於查詢起日。", nameof(throughDate));
         }
 
         bool IsRecordablePendingOrder(JsonElement row)
@@ -87,7 +105,7 @@ public sealed class WmsApiClient
         do
         {
             var path = "/api_v1/order/order_query.php" +
-                       $"?date_min={WmsQueryPolicy.InitialOrderDate:yyyy-MM-dd}" +
+                       $"?date_min={fromDate:yyyy-MM-dd}" +
                        $"&date_max={throughDate:yyyy-MM-dd}" +
                        $"&status=F&nowpage={page}&pagesize=500";
             var authorizedResult = await SendAuthorizedForJsonAsync(
@@ -141,7 +159,7 @@ public sealed class WmsApiClient
             : "[\n" + string.Join(",\n", safePages) + "\n]";
         return new PreviewResult(
             true,
-            $"查詢成功，訂單成立日 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd} 至 {throughDate:yyyy/MM/dd}，共 {rows.Count} 筆包含蛋黃酥品項的待處理訂單。",
+            $"查詢成功，訂單成立日 {fromDate:yyyy/MM/dd} 至 {throughDate:yyyy/MM/dd}，共 {rows.Count} 筆包含蛋黃酥品項的待處理訂單。",
             rows,
             safeJson,
             new PreviewMetadata(

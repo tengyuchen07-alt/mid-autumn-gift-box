@@ -18,6 +18,30 @@ public static class WmsQueryPolicy
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(instant, TaipeiTimeZone).DateTime);
 }
 
+public sealed record SyncWindow(DateOnly FromDate, DateOnly ThroughDate, DateTimeOffset StartedAt);
+
+public static class SyncWindowPolicy
+{
+    public static SyncWindow Create(DateTimeOffset? lastSuccessAt, DateTimeOffset startedAt)
+    {
+        var throughDate = WmsQueryPolicy.GetTaipeiDate(startedAt);
+        var fromDate = lastSuccessAt is null
+            ? WmsQueryPolicy.InitialOrderDate
+            : WmsQueryPolicy.GetTaipeiDate(lastSuccessAt.Value);
+        if (fromDate < WmsQueryPolicy.InitialOrderDate)
+        {
+            fromDate = WmsQueryPolicy.InitialOrderDate;
+        }
+
+        if (fromDate > throughDate)
+        {
+            fromDate = throughDate;
+        }
+
+        return new SyncWindow(fromDate, throughDate, startedAt);
+    }
+}
+
 public sealed record PreviewResult(
     bool IsSuccess,
     string Message,

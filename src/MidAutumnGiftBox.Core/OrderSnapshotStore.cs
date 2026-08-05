@@ -22,7 +22,15 @@ public sealed record OrderLineSnapshot(
     decimal Quantity,
     decimal ShippedQuantity,
     string? StatusCode,
-    DateTimeOffset SynchronizedAt);
+    DateTimeOffset SynchronizedAt,
+    string? ChannelName = null,
+    string? ShipWindowStart = null,
+    string? ShipWindowEnd = null,
+    string? ShippingDateSource = null,
+    string? ShippingDateStatus = null,
+    string? ProductType = null,
+    string? StatusName = null,
+    string? TotalPrice = null);
 
 public sealed class OrderSnapshotStore
 {
@@ -79,6 +87,68 @@ public sealed class OrderSnapshotStore
                 .ThenBy(line => line.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            await SaveAsync(combined, cancellationToken);
+        }
+        finally
+        {
+            _fileLock.Release();
+        }
+    }
+
+    public async Task ReplaceSourceRangeAsync(
+        string sourceCode,
+        DateOnly fromDate,
+        DateOnly throughDate,
+        IReadOnlyList<IReadOnlyDictionary<string, string?>> rows,
+        DateTimeOffset synchronizedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceCode);
+        ArgumentNullException.ThrowIfNull(rows);
+        if (throughDate < fromDate)
+        {
+            throw new ArgumentException("增量快照查詢迄日不可早於起日。");
+        }
+
+        var replacement = ExpandRows(sourceCode, rows, synchronizedAt);
+        EnsureUniqueKeys(replacement);
+        foreach (var line in replacement)
+        {
+            var orderDate = ParseRequiredOrderDate(line);
+            if (orderDate < fromDate || orderDate > throughDate)
+            {
+                throw new InvalidDataException(
+                    $"訂單 {line.ExternalOrderNo} 的成立日不在本次同步範圍內，未提交本次同步。");
+            }
+        }
+
+        await _fileLock.WaitAsync(cancellationToken);
+        try
+        {
+            var existing = await LoadAsync(cancellationToken);
+            var retained = new List<OrderLineSnapshot>(existing.Count);
+            foreach (var line in existing)
+            {
+                if (!line.SourceCode.Equals(sourceCode, StringComparison.OrdinalIgnoreCase))
+                {
+                    retained.Add(line);
+                    continue;
+                }
+
+                var orderDate = ParseRequiredOrderDate(line);
+                if (orderDate < fromDate || orderDate > throughDate)
+                {
+                    retained.Add(line);
+                }
+            }
+
+            var combined = retained
+                .Concat(replacement)
+                .OrderBy(line => line.SourceCode, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(line => line.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            EnsureUniqueKeys(combined);
             await SaveAsync(combined, cancellationToken);
         }
         finally
@@ -188,6 +258,22 @@ public sealed class OrderSnapshotStore
         }
     }
 
+    private static DateOnly ParseRequiredOrderDate(OrderLineSnapshot line)
+    {
+        if (!string.IsNullOrWhiteSpace(line.OrderDate) &&
+            DateTime.TryParse(
+                line.OrderDate,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var parsed))
+        {
+            return DateOnly.FromDateTime(parsed);
+        }
+
+        throw new InvalidDataException(
+            $"訂單 {line.ExternalOrderNo} 缺少有效成立日，未提交本次同步。");
+    }
+
     private static OrderLineSnapshot CreateLine(
         string sourceCode,
         string orderNo,
@@ -214,7 +300,15 @@ public sealed class OrderSnapshotStore
             GetDecimal(product, "qty", "商品數量"),
             GetDecimal(product, "shipp_qty", "已出貨數量"),
             GetRowValue(row, "status_code"),
-            synchronizedAt);
+            synchronizedAt,
+            GetRowValue(row, "source"),
+            GetRowValue(row, "ship_window_start"),
+            GetRowValue(row, "ship_window_end"),
+            GetRowValue(row, "shipping_date_source"),
+            GetRowValue(row, "shipping_date_status"),
+            GetScalarText(product, "type"),
+            GetRowValue(row, "status_name"),
+            GetRowValue(row, "total_price"));
 
     private async Task<List<OrderLineSnapshot>> LoadAsync(CancellationToken cancellationToken)
     {

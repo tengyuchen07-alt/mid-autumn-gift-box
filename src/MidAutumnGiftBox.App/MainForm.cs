@@ -53,7 +53,7 @@ internal sealed class MainForm : Form
     };
     private readonly Button _saveButton = new() { Text = "安全保存憑證", AutoSize = true };
     private readonly Button _shopsButton = new() { Text = "取得店舖清單", AutoSize = true };
-    private readonly Button _ordersButton = new() { Text = "載入蛋黃酥待處理訂單", AutoSize = true, Enabled = false };
+    private readonly Button _ordersButton = new() { Text = "立即同步蛋黃酥訂單", AutoSize = true };
     private readonly Button _exportButton = new() { Text = "匯出 Excel", AutoSize = true, Enabled = false };
     private readonly DataGridView _grid = new()
     {
@@ -116,8 +116,7 @@ internal sealed class MainForm : Form
         _ordersButton.Click += async (_, _) => await LoadOrdersAsync();
         _exportButton.Click += (_, _) => ExportPreview();
         _orderRangeLabel.Text =
-            $"訂單成立日：{WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd} ～ {DateTime.Today:yyyy/MM/dd}；" +
-            "顯示蛋黃酥／指定 SKU，到貨日可空白";
+            $"首次從 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd}；之後從最後成功日包含式同步，到貨日可空白";
 
         Shown += async (_, _) => await LoadCredentialStatusAsync();
     }
@@ -246,6 +245,7 @@ internal sealed class MainForm : Form
             : "尚未保存憑證。";
         _savedStateLabel.ForeColor = display.HasSavedKey ? Color.SeaGreen : Color.DimGray;
         await LoadSyncStatusAsync(source.Code);
+        await LoadCommittedPreviewAsync(source);
         UpdateOrderButtonState();
     }
 
@@ -279,50 +279,63 @@ internal sealed class MainForm : Form
     {
         await RunBusyAsync("正在取得包含蛋黃酥品項的待處理訂單…", async () =>
         {
-            if (!_shopValidatedSources.Contains(SelectedSource.Code))
-            {
-                throw new InvalidOperationException("請先成功取得這個來源的店舖清單，再查詢訂單。");
-            }
-
             var source = SelectedSource;
             var startedAt = DateTimeOffset.Now;
-            var throughDate = WmsQueryPolicy.GetTaipeiDate(startedAt);
+            var lockDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "MidAutumnGiftBox",
+                "locks");
+            using var sourceLock = SourceSyncFileLock.TryAcquire(lockDirectory, source.Code)
+                ?? throw new InvalidOperationException("此來源同步進行中，請稍後再試。");
+            var previousStatus = await _syncStatusStore.GetAsync(source.Code);
+            var window = SyncWindowPolicy.Create(previousStatus?.LastSuccessAt, startedAt);
             ApiCredentials? credentials = null;
             try
             {
                 credentials = await ResolveCredentialsAsync();
-                var result = await _wmsClient.GetPendingOrdersSinceInitialDateAsync(
+                var shops = await _wmsClient.GetShopsAsync(source, credentials);
+                if (!shops.IsSuccess)
+                {
+                    throw new WmsApiException(shops.Message);
+                }
+
+                _shopValidatedSources.Add(source.Code);
+                var result = await _wmsClient.GetPendingOrdersAsync(
                     source,
                     credentials,
-                    throughDate);
+                    window.FromDate,
+                    window.ThroughDate);
                 if (!result.IsSuccess)
                 {
                     throw new WmsApiException(result.Message);
                 }
 
                 var finishedAt = DateTimeOffset.Now;
-                await _orderSnapshotStore.ReplaceSourceAsync(
+                await _orderSnapshotStore.ReplaceSourceRangeAsync(
                     source.Code,
+                    window.FromDate,
+                    window.ThroughDate,
                     result.Rows,
                     finishedAt);
-                ShowPreview(result);
                 try
                 {
                     await _syncStatusStore.RecordSuccessAsync(new SyncRunSummary(
                         source.Code,
                         source.Name,
-                        WmsQueryPolicy.InitialOrderDate,
-                        throughDate,
+                        window.FromDate,
+                        window.ThroughDate,
                         startedAt,
                         finishedAt,
                         result.Metadata.PageCount,
                         result.Metadata.RowCount));
                     await LoadSyncStatusAsync(source.Code);
+                    await LoadCommittedPreviewAsync(source);
                     return result.Message + "；本機訂單快照已更新。";
                 }
                 catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
                 {
                     ShowSyncStatusStorageError("訂單已載入，但本機同步摘要無法保存。", statusException);
+                    await LoadCommittedPreviewAsync(source);
                     return result.Message + "（本機同步摘要未保存）";
                 }
             }
@@ -335,8 +348,8 @@ internal sealed class MainForm : Form
                     await _syncStatusStore.RecordFailureAsync(new SyncRunFailure(
                         source.Code,
                         source.Name,
-                        WmsQueryPolicy.InitialOrderDate,
-                        throughDate,
+                        window.FromDate,
+                        window.ThroughDate,
                         startedAt,
                         DateTimeOffset.Now,
                         RedactSyncError(
@@ -388,6 +401,52 @@ internal sealed class MainForm : Form
             $"分頁：{status.PageCount}　筆數：{status.RecordCount}　最後成功：{lastSuccessText}" +
             (status.Status == "failed" ? $"　原因：{status.ErrorSummary}" : string.Empty);
         _syncStatusLabel.ForeColor = status.Status == "success" ? Color.SeaGreen : Color.Firebrick;
+    }
+
+    private async Task LoadCommittedPreviewAsync(WmsSource source)
+    {
+        try
+        {
+            var snapshot = await _orderSnapshotStore.GetAllAsync();
+            if (_sourceBox.SelectedItem is not WmsSource selected ||
+                !selected.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var sourceLines = snapshot
+                .Where(line => line.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (sourceLines.Length == 0)
+            {
+                _lastPreview = null;
+                _exportButton.Enabled = false;
+                _grid.DataSource = null;
+                _jsonBox.Clear();
+                _previewMetadataLabel.Text = "此來源尚無已提交訂單快照。";
+                return;
+            }
+
+            SyncSourceStatus? status = null;
+            try
+            {
+                status = await _syncStatusStore.GetAsync(source.Code);
+            }
+            catch (Exception exception) when (IsSyncStatusStorageError(exception))
+            {
+                ShowSyncStatusStorageError("同步摘要無法讀取，已顯示最後提交的訂單快照。", exception);
+            }
+
+            if (_sourceBox.SelectedItem is WmsSource current &&
+                current.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+            {
+                ShowPreview(OrderSnapshotPreviewBuilder.Build(source, sourceLines, status));
+            }
+        }
+        catch (Exception exception) when (IsSyncStatusStorageError(exception))
+        {
+            ShowSyncStatusStorageError("本機訂單快照無法讀取。", exception);
+        }
     }
 
     private void ShowSyncStatusStorageError(string message, Exception exception)
@@ -529,7 +588,9 @@ internal sealed class MainForm : Form
             var completionMessage = await action();
             _statusLabel.Text = completionMessage;
         }
-        catch (Exception exception) when (exception is WmsApiException or ArgumentException or InvalidOperationException or Win32Exception)
+        catch (Exception exception) when (exception is WmsApiException or ArgumentException or
+                                          InvalidOperationException or Win32Exception or IOException or
+                                          UnauthorizedAccessException or System.Text.Json.JsonException)
         {
             _statusLabel.Text = "操作失敗";
             MessageBox.Show(this, exception.Message, "無法完成操作", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -545,9 +606,7 @@ internal sealed class MainForm : Form
         _sourceBox.Enabled = !busy;
         _saveButton.Enabled = !busy;
         _shopsButton.Enabled = !busy;
-        _ordersButton.Enabled = !busy &&
-                                _sourceBox.SelectedItem is WmsSource source &&
-                                _shopValidatedSources.Contains(source.Code);
+        _ordersButton.Enabled = !busy && _sourceBox.SelectedItem is WmsSource;
         _exportButton.Enabled = !busy && _lastPreview is { Rows.Count: > 0 };
         _progress.Visible = busy;
         Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
@@ -556,8 +615,7 @@ internal sealed class MainForm : Form
 
     private void UpdateOrderButtonState()
     {
-        _ordersButton.Enabled = _sourceBox.SelectedItem is WmsSource source &&
-                                _shopValidatedSources.Contains(source.Code);
+        _ordersButton.Enabled = _sourceBox.SelectedItem is WmsSource;
     }
 
     private void InvalidateShopValidationForCurrentSource()

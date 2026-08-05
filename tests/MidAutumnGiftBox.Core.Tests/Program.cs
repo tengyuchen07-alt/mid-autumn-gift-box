@@ -28,6 +28,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("來源訂單快照重跑會更新商品且不影響另一來源", OrderSnapshotReplacesOneSourceWithoutDuplicates),
     ("訂單快照遇到重複唯一鍵會拒絕整批資料", OrderSnapshotRejectsDuplicateUniqueKeys),
     ("訂單快照遇到無效數量會保留舊資料", OrderSnapshotRejectsInvalidQuantities),
+    ("已提交快照會重建相同的畫面與 Excel 父子商品", CommittedSnapshotBuildsPreviewAndExcel),
+    ("同步範圍會從最後成功的台北日期包含式重抓", SyncWindowIncludesLastSuccessfulTaipeiDate),
+    ("增量快照只取代來源的訂單成立日範圍", IncrementalSnapshotReplacesOnlyQueriedOrderDates),
+    ("增量訂單 API 會送出明確的成立日起訖", ExplicitOrderRangeIsSentToWms),
+    ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
 };
 
 var failed = 0;
@@ -1071,6 +1076,159 @@ static async Task OrderSnapshotRejectsInvalidQuantities()
     {
         if (Directory.Exists(directory)) Directory.Delete(directory, true);
     }
+}
+
+static Task CommittedSnapshotBuildsPreviewAndExcel()
+{
+    var synchronizedAt = new DateTimeOffset(2026, 8, 5, 9, 10, 0, TimeSpan.FromHours(8));
+    var lines = new OrderLineSnapshot[]
+    {
+        new("site1", "R001", "parent:item_no:P01:1", "parent", null,
+            "shopee", "芝初 SesaOle", "2026/08/04 11:36:00", null, "2026-08-24",
+            "BOX-001", "P01", "蛋黃酥禮盒", "8/22-8/28當週出貨", 1m, 0m, "F", synchronizedAt),
+        new("site1", "R001", "item:parent:item_no:P01:1:item_no:I01:1", "item", "parent:item_no:P01:1",
+            "shopee", "芝初 SesaOle", "2026/08/04 11:36:00", null, "2026-08-24",
+            "4710964232565", "I01", "蛋黃酥9入", null, 9m, 0m, "F", synchronizedAt)
+    };
+    var status = new SyncSourceStatus(
+        "site1", "網站1－睿驛", new DateOnly(2026, 7, 1), new DateOnly(2026, 8, 5),
+        "success", synchronizedAt.AddMinutes(-2), synchronizedAt, 3, 1, synchronizedAt, string.Empty);
+
+    var preview = OrderSnapshotPreviewBuilder.Build(
+        new WmsSource("site1", "網站1－睿驛", new Uri("https://example.test")), lines, status);
+    Equal(1, preview.Rows.Count, "Snapshot lines should rebuild one order row.");
+    Equal("R001", preview.Rows[0]["order_no"], "The rebuilt order number is incorrect.");
+    Contains("BOX-001", preview.Rows[0]["products"] ?? string.Empty, "The rebuilt parent product is missing.");
+    Contains("4710964232565", preview.Rows[0]["products"] ?? string.Empty, "The rebuilt nested item is missing.");
+    Contains("4710964232565", preview.SafeJson, "Safe JSON was not rebuilt from the committed snapshot.");
+
+    var path = Path.Combine(Path.GetTempPath(), $"snapshot-preview-{Guid.NewGuid():N}.xlsx");
+    try
+    {
+        PreviewWorkbookExporter.Export(path, preview);
+        using var archive = ZipFile.OpenRead(path);
+        var productSheet = archive.GetEntry("xl/worksheets/sheet2.xml")
+            ?? throw new InvalidOperationException("Product worksheet is missing.");
+        using var reader = new StreamReader(productSheet.Open(), Encoding.UTF8);
+        var xml = reader.ReadToEnd();
+        Contains("BOX-001", xml, "Excel was not generated from the committed parent product.");
+        Contains("4710964232565", xml, "Excel was not generated from the committed nested item.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task SyncWindowIncludesLastSuccessfulTaipeiDate()
+{
+    var startedAt = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    var first = SyncWindowPolicy.Create(null, startedAt);
+    Equal(new DateOnly(2026, 7, 1), first.FromDate, "First sync should use the initial order date.");
+    Equal(new DateOnly(2026, 8, 5), first.ThroughDate, "Sync upper date should be fixed at run start.");
+
+    var lastSuccess = new DateTimeOffset(2026, 8, 4, 16, 30, 0, TimeSpan.Zero);
+    var incremental = SyncWindowPolicy.Create(lastSuccess, startedAt);
+    Equal(new DateOnly(2026, 8, 5), incremental.FromDate,
+        "The last successful instant should be converted to its Taipei date inclusively.");
+    Equal(startedAt, incremental.StartedAt, "The run start instant should remain fixed.");
+    return Task.CompletedTask;
+}
+
+static async Task IncrementalSnapshotReplacesOnlyQueriedOrderDates()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-range-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "order-snapshot.json");
+    var store = new OrderSnapshotStore(path);
+    IReadOnlyDictionary<string, string?> Row(string orderNo, string orderDate, int quantity) =>
+        new Dictionary<string, string?>
+        {
+            ["order_no"] = orderNo,
+            ["order_date"] = orderDate,
+            ["products"] = $"[{{\"sku\":\"4710964232411\",\"qty\":{quantity}}}]"
+        };
+
+    try
+    {
+        await store.ReplaceSourceAsync("site1",
+            [Row("OLD", "2026/07/10 08:00:00", 1), Row("REMOVE", "2026/08/04 08:00:00", 2)],
+            DateTimeOffset.UtcNow);
+        await store.ReplaceSourceAsync("site2", [Row("OTHER", "2026/08/04 08:00:00", 4)], DateTimeOffset.UtcNow);
+
+        await new OrderSnapshotStore(path).ReplaceSourceRangeAsync(
+            "site1",
+            new DateOnly(2026, 8, 4),
+            new DateOnly(2026, 8, 5),
+            [Row("NEW", "2026/08/05 09:00:00", 3)],
+            DateTimeOffset.UtcNow);
+
+        var snapshot = await store.GetAllAsync();
+        Equal(3, snapshot.Count, "Range replacement kept stale rows or removed out-of-range/source rows.");
+        True(snapshot.Any(line => line.SourceCode == "site1" && line.ExternalOrderNo == "OLD"),
+            "An older site1 order outside the queried range was removed.");
+        True(snapshot.Any(line => line.SourceCode == "site1" && line.ExternalOrderNo == "NEW" && line.Quantity == 3m),
+            "The new in-range site1 order was not inserted.");
+        True(snapshot.Any(line => line.SourceCode == "site2" && line.ExternalOrderNo == "OTHER"),
+            "Replacing site1 range changed site2.");
+        True(snapshot.All(line => line.ExternalOrderNo != "REMOVE"),
+            "A stale site1 order inside the queried range was not removed.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static async Task ExplicitOrderRangeIsSentToWms()
+{
+    var handler = new RecordingHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath == "/api_v1/token/authorize.php")
+        {
+            return Json("{\"result\":{\"ok\":true,\"access_token\":\"token\"}}");
+        }
+
+        Contains("date_min=2026-08-04", request.RequestUri.Query, "Incremental start date was not sent.");
+        Contains("date_max=2026-08-05", request.RequestUri.Query, "Fixed run upper date was not sent.");
+        Contains("status=F", request.RequestUri.Query, "Pending status was not sent.");
+        return Json("{\"result\":{\"ok\":true},\"data\":{\"maxpage\":1,\"rows\":[]}}");
+    });
+    var client = new WmsApiClient(new HttpClient(handler));
+
+    var result = await client.GetPendingOrdersAsync(
+        new WmsSource("site1", "網站1", new Uri("https://example.test")),
+        new ApiCredentials("id", "key"),
+        new DateOnly(2026, 8, 4),
+        new DateOnly(2026, 8, 5));
+    True(result.IsSuccess, "Explicit incremental range query should succeed.");
+}
+
+static Task SourceSyncLockIsExclusive()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-lock-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        using var first = SourceSyncFileLock.TryAcquire(directory, "site1")
+            ?? throw new InvalidOperationException("First source lock should be acquired.");
+        var second = SourceSyncFileLock.TryAcquire(directory, "site1");
+        True(second is null, "A second lock for the same source should not be acquired.");
+        second?.Dispose();
+
+        using var otherSource = SourceSyncFileLock.TryAcquire(directory, "site2")
+            ?? throw new InvalidOperationException("A different source should have an independent lock.");
+        first.Dispose();
+        using var afterRelease = SourceSyncFileLock.TryAcquire(directory, "site1")
+            ?? throw new InvalidOperationException("Released source lock should be acquirable again.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+
+    return Task.CompletedTask;
 }
 
 static HttpResponseMessage Json(string value) => new(HttpStatusCode.OK)
