@@ -53,8 +53,8 @@ internal sealed class MainForm : Form
     };
     private readonly Button _saveButton = new() { Text = "安全保存憑證", AutoSize = true };
     private readonly Button _shopsButton = new() { Text = "取得店舖清單", AutoSize = true };
-    private readonly Button _ordersButton = new() { Text = "立即同步蛋黃酥訂單", AutoSize = true };
-    private readonly Button _exportButton = new() { Text = "匯出 Excel", AutoSize = true, Enabled = false };
+    private readonly Button _ordersButton = new() { Text = "立即同步兩網站蛋黃酥訂單", AutoSize = true };
+    private readonly Button _exportButton = new() { Text = "匯出／追加三種禮盒 Excel", AutoSize = true };
     private readonly DataGridView _grid = new()
     {
         Dock = DockStyle.Fill,
@@ -83,7 +83,6 @@ internal sealed class MainForm : Form
     private readonly OrderChangeLedgerStore _orderChangeLedgerStore;
     private readonly WmsApiClient _wmsClient;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
-    private PreviewResult? _lastPreview;
 
     public MainForm()
     {
@@ -118,7 +117,7 @@ internal sealed class MainForm : Form
         _apiKeyBox.TextChanged += (_, _) => InvalidateShopValidationForCurrentSource();
         _saveButton.Click += async (_, _) => await SaveCredentialsAsync();
         _shopsButton.Click += async (_, _) => await LoadShopsAsync();
-        _ordersButton.Click += async (_, _) => await LoadOrdersAsync();
+        _ordersButton.Click += async (_, _) => await LoadAllOrdersAsync();
         _exportButton.Click += async (_, _) => await ExportPreviewAsync();
         _orderRangeLabel.Text =
             $"每次依訂單成立日重抓 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd} 至本次執行日；到貨日可空白";
@@ -286,40 +285,58 @@ internal sealed class MainForm : Form
         });
     }
 
-    private async Task LoadOrdersAsync()
+    private async Task LoadAllOrdersAsync()
     {
-        await RunBusyAsync("正在取得包含蛋黃酥品項的待處理訂單…", async () =>
+        await RunBusyAsync("正在依序同步兩個網站的蛋黃酥訂單…", async () =>
         {
-            var source = SelectedSource;
-            var startedAt = DateTimeOffset.Now;
-            var lockDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "MidAutumnGiftBox",
-                "locks");
-            using var sourceLock = SourceSyncFileLock.TryAcquire(lockDirectory, source.Code)
-                ?? throw new InvalidOperationException("此來源同步進行中，請稍後再試。");
-            var previousStatus = await _syncStatusStore.GetAsync(source.Code);
-            var window = SyncWindowPolicy.Create(previousStatus?.LastSuccessAt, startedAt);
-            ApiCredentials? credentials = null;
-            try
+            var credentialsBySource = new Dictionary<string, ApiCredentials>(StringComparer.OrdinalIgnoreCase);
+            foreach (var source in Sources)
             {
-                credentials = await ResolveCredentialsAsync();
-                var shops = await _wmsClient.GetShopsAsync(source, credentials);
-                if (!shops.IsSuccess)
-                {
-                    throw new WmsApiException(shops.Message);
-                }
+                credentialsBySource[source.Code] = await ResolveCredentialsForSourceAsync(source);
+            }
 
-                _shopValidatedSources.Add(source.Code);
-                var result = await _wmsClient.GetPendingOrdersAsync(
-                    source,
-                    credentials,
-                    window.FromDate,
-                    window.ThroughDate);
-                if (!result.IsSuccess)
-                {
-                    throw new WmsApiException(result.Message);
-                }
+            var messages = new List<string>();
+            foreach (var source in Sources)
+            {
+                messages.Add(await SynchronizeSourceAsync(source, credentialsBySource[source.Code]));
+            }
+
+            var selected = SelectedSource;
+            await LoadSyncStatusAsync(selected.Code);
+            await LoadCommittedPreviewAsync(selected);
+            return $"兩個網站同步完成。{string.Join("　", messages)}";
+        });
+    }
+
+    private async Task<string> SynchronizeSourceAsync(WmsSource source, ApiCredentials credentials)
+    {
+        var startedAt = DateTimeOffset.Now;
+        var lockDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MidAutumnGiftBox",
+            "locks");
+        using var sourceLock = SourceSyncFileLock.TryAcquire(lockDirectory, source.Code)
+            ?? throw new InvalidOperationException($"{source.Name} 同步進行中，請稍後再試。");
+        var previousStatus = await _syncStatusStore.GetAsync(source.Code);
+        var window = SyncWindowPolicy.Create(previousStatus?.LastSuccessAt, startedAt);
+        try
+        {
+            var shops = await _wmsClient.GetShopsAsync(source, credentials);
+            if (!shops.IsSuccess)
+            {
+                throw new WmsApiException(shops.Message);
+            }
+
+            _shopValidatedSources.Add(source.Code);
+            var result = await _wmsClient.GetPendingOrdersAsync(
+                source,
+                credentials,
+                window.FromDate,
+                window.ThroughDate);
+            if (!result.IsSuccess)
+            {
+                throw new WmsApiException(result.Message);
+            }
 
                 var finishedAt = DateTimeOffset.Now;
                 var allPreviousLines = await _orderSnapshotStore.GetAllAsync();
@@ -389,38 +406,37 @@ internal sealed class MainForm : Form
                     await LoadCommittedPreviewAsync(source);
                     return result.Message + "（本機同步摘要未保存）";
                 }
-            }
-            catch (Exception exception) when (exception is WmsApiException or ArgumentException or
-                                              InvalidOperationException or Win32Exception or IOException or
-                                              UnauthorizedAccessException or System.Text.Json.JsonException)
+        }
+        catch (Exception exception) when (exception is WmsApiException or ArgumentException or
+                                          InvalidOperationException or Win32Exception or IOException or
+                                          UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            try
             {
-                try
-                {
-                    await _syncStatusStore.RecordFailureAsync(new SyncRunFailure(
-                        source.Code,
-                        source.Name,
-                        window.FromDate,
-                        window.ThroughDate,
-                        startedAt,
-                        DateTimeOffset.Now,
-                        RedactSyncError(
-                            exception.Message,
-                            _apiIdBox.Text,
-                            _apiKeyBox.Text,
-                            credentials?.ApiId,
-                            credentials?.ApiKey,
-                            BuildBasicCredential(_apiIdBox.Text, _apiKeyBox.Text),
-                            BuildBasicCredential(credentials?.ApiId, credentials?.ApiKey))));
-                    await LoadSyncStatusAsync(source.Code);
-                }
-                catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
-                {
-                    ShowSyncStatusStorageError("同步失敗，且本機同步摘要無法保存。", statusException);
-                }
-
-                throw;
+                await _syncStatusStore.RecordFailureAsync(new SyncRunFailure(
+                    source.Code,
+                    source.Name,
+                    window.FromDate,
+                    window.ThroughDate,
+                    startedAt,
+                    DateTimeOffset.Now,
+                    RedactSyncError(
+                        exception.Message,
+                        _apiIdBox.Text,
+                        _apiKeyBox.Text,
+                        credentials.ApiId,
+                        credentials.ApiKey,
+                        BuildBasicCredential(_apiIdBox.Text, _apiKeyBox.Text),
+                        BuildBasicCredential(credentials.ApiId, credentials.ApiKey))));
+                await LoadSyncStatusAsync(source.Code);
             }
-        });
+            catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
+            {
+                ShowSyncStatusStorageError("同步失敗，且本機同步摘要無法保存。", statusException);
+            }
+
+            throw;
+        }
     }
 
     private async Task LoadSyncStatusAsync(string sourceCode)
@@ -480,8 +496,6 @@ internal sealed class MainForm : Form
                     entry.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase));
                 if (!hasChangeHistory)
                 {
-                    _lastPreview = null;
-                    _exportButton.Enabled = false;
                     _grid.DataSource = null;
                     _jsonBox.Clear();
                     _previewMetadataLabel.Text = "此來源尚無已提交訂單快照。";
@@ -551,6 +565,24 @@ internal sealed class MainForm : Form
             _apiKeyBox.Text);
     }
 
+    private async Task<ApiCredentials> ResolveCredentialsForSourceAsync(WmsSource source)
+    {
+        if (_sourceBox.SelectedItem is WmsSource selected &&
+            selected.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+        {
+            return await ResolveCredentialsAsync();
+        }
+
+        var stored = await _credentialManager.GetForUseAsync(source.Code);
+        if (stored is null || !stored.IsComplete)
+        {
+            throw new InvalidOperationException(
+                $"請先切換到「{source.Name}」並安全保存該網站的 API ID 與 API Key。");
+        }
+
+        return stored;
+    }
+
     private void ShowPreview(PreviewResult result)
     {
         var metadata = result.Metadata;
@@ -567,32 +599,38 @@ internal sealed class MainForm : Form
 
         _grid.DataSource = BuildTable(result.Rows);
         _jsonBox.Text = result.SafeJson;
-        var isOrderPreview = metadata.Endpoint.Equals(
-            "/api_v1/order/order_query.php",
-            StringComparison.OrdinalIgnoreCase);
-        _lastPreview = isOrderPreview ? result : null;
-        _exportButton.Enabled = isOrderPreview;
     }
 
     private async Task ExportPreviewAsync()
     {
-        if (_lastPreview is null)
+        IReadOnlyList<OrderChangeEntry> changeEntries;
+        try
         {
-            MessageBox.Show(this, "請先載入有資料的預覽，再匯出 Excel。", "尚無可匯出資料",
+            changeEntries = await _orderChangeLedgerStore.GetAllAsync();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                          System.Text.Json.JsonException)
+        {
+            MessageBox.Show(this, $"無法讀取異動紀錄：{exception.Message}", "匯出失敗",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (changeEntries.Count == 0)
+        {
+            MessageBox.Show(this, "請先同步兩個網站，再匯出 Excel。", "尚無可匯出資料",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var safeSourceName = string.Concat(_lastPreview.Metadata.SourceName
-            .Where(character => !Path.GetInvalidFileNameChars().Contains(character)));
         using var dialog = new SaveFileDialog
         {
-            Title = "建立或追加中秋禮盒 Excel",
+            Title = "建立或追加三種中秋禮盒 Excel",
             Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
             DefaultExt = "xlsx",
             AddExtension = true,
             OverwritePrompt = true,
-            FileName = $"中秋禮盒預覽_{safeSourceName}_{DateTime.Now:yyyyMMdd_HHmm}.xlsx"
+            FileName = "中秋禮盒訂單統計.xlsx"
         };
 
         if (dialog.ShowDialog(this) != DialogResult.OK)
@@ -602,12 +640,11 @@ internal sealed class MainForm : Form
 
         try
         {
-            var changeEntries = await _orderChangeLedgerStore.GetAllAsync();
-            PreviewWorkbookExporter.Export(dialog.FileName, _lastPreview, changeEntries);
+            GiftBoxWorkbookExporter.Export(dialog.FileName, changeEntries);
             _statusLabel.Text = $"Excel 已匯出：{dialog.FileName}";
             MessageBox.Show(this,
-                "Excel 匯出完成。\n包含「訂單預覽」、「商品明細」與追加式「異動紀錄」。\n" +
-                "再次選取同一檔案時，只會補上新異動，既有「確認」內容會保留。",
+                "Excel 匯出完成。\n包含「三入」、「六入」、「九入」三張工作表，資料已合併兩個網站。\n" +
+                "數量以 Excel 數字保存；再次選取同一檔案時，只補新列並保留既有「確認」。",
                 "匯出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
@@ -685,7 +722,7 @@ internal sealed class MainForm : Form
         _saveButton.Enabled = !busy;
         _shopsButton.Enabled = !busy;
         _ordersButton.Enabled = !busy && _sourceBox.SelectedItem is WmsSource;
-        _exportButton.Enabled = !busy && _lastPreview is { Rows.Count: > 0 };
+        _exportButton.Enabled = !busy;
         _progress.Visible = busy;
         Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         _statusLabel.Text = message;

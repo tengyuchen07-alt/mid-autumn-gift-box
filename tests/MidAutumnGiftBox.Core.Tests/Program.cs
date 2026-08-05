@@ -38,6 +38,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("離開待處理後只有取消退貨沖銷且刪除併單待人工確認", DepartedOrdersUseResolvedStatusRules),
     ("異動紀錄只追加且重試不會重複寫入", ChangeLedgerIsAppendOnlyAndIdempotent),
     ("Excel 追加新異動時會保留人工確認欄", ExcelAppendPreservesManualConfirmation),
+    ("兩網站禮盒會依三六九入輸出且數量為 Excel 數字", ThreeGiftBoxSheetsCombineSourcesAndUseNumericQuantities),
+    ("三種禮盒 Excel 追加時保留確認且不重複", ThreeGiftBoxWorkbookAppendPreservesConfirmation),
+    ("舊異動名稱依蛋黃酥入數分流且不誤用芝麻粉倍數", GiftBoxSizeUsesEggYolkCountNotOtherMultipliers),
     ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
     ("最近同步失敗不會把最後提交快照標成失敗資料", FailedSyncKeepsCommittedPreviewValid),
     ("快照投影遇到孤立子商品會拒絕顯示", SnapshotPreviewRejectsOrphanItems),
@@ -1410,6 +1413,135 @@ static Task ExcelAppendPreservesManualConfirmation()
         if (File.Exists(path)) File.Delete(path);
     }
 
+    return Task.CompletedTask;
+}
+
+static Task ThreeGiftBoxSheetsCombineSourcesAndUseNumericQuantities()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-three-box-{Guid.NewGuid():N}.xlsx");
+    var at = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    OrderChangeEntry Entry(string id, string sourceCode, string sourceName, string orderNo, string sku,
+        string productName, decimal quantity) =>
+        new(id, at, sourceCode, sourceName, orderNo, "parent:A", "蝦皮賣場",
+            "2026/08/04 08:00:00", "2026-08-24", sku, productName,
+            0m, quantity, quantity, "新增", "F", "待處理", false, string.Empty);
+    var entries = new[]
+    {
+        Entry("THREE", "site1", "網站1－睿驛", "R-3", "4710964232435", "蛋黃酥小禮盒", 2m),
+        Entry("SIX", "site2", "網站2－Flavor", "F-6", "4710964232411", "蛋黃酥禮盒", 3m),
+        Entry("NINE", "site1", "網站1－睿驛", "R-9", "4710964232565", "蛋黃酥9入禮盒", 4m),
+        Entry("SINGLE", "site1", "網站1－睿驛", "R-1", "SINGLE", "蛋黃酥 單入包裝", 1m)
+    };
+
+    try
+    {
+        GiftBoxWorkbookExporter.Export(path, entries);
+        using var archive = ZipFile.OpenRead(path);
+        using (var reader = new StreamReader(
+                   (archive.GetEntry("xl/workbook.xml")
+                    ?? throw new InvalidOperationException("Workbook metadata is missing.")).Open(), Encoding.UTF8))
+        {
+            var workbookXml = reader.ReadToEnd();
+            Contains("三入", workbookXml, "Three-piece worksheet is missing.");
+            Contains("六入", workbookXml, "Six-piece worksheet is missing.");
+            Contains("九入", workbookXml, "Nine-piece worksheet is missing.");
+            DoesNotContain("訂單預覽", workbookXml, "Legacy preview worksheet should not remain.");
+        }
+
+        XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        XDocument Sheet(string name)
+        {
+            using var stream = (archive.GetEntry(name)
+                                ?? throw new InvalidOperationException($"Worksheet {name} is missing.")).Open();
+            return XDocument.Load(stream);
+        }
+
+        var three = Sheet("xl/worksheets/sheet1.xml");
+        Contains("R-3", three.ToString(), "Site1 three-piece order is missing.");
+        DoesNotContain("R-1", three.ToString(), "Single-piece item must not enter the three-piece worksheet.");
+        var quantityCell = three.Descendants(spreadsheet + "c")
+            .Single(cell => (string?)cell.Attribute("r") == "D2");
+        Equal(null, (string?)quantityCell.Attribute("t"), "Quantity cell must not be stored as text.");
+        Equal("2", quantityCell.Element(spreadsheet + "v")?.Value, "Numeric quantity value is incorrect.");
+
+        var six = Sheet("xl/worksheets/sheet2.xml");
+        Contains("F-6", six.ToString(), "Site2 six-piece order is missing from the same workbook.");
+        var nine = Sheet("xl/worksheets/sheet3.xml");
+        Contains("R-9", nine.ToString(), "Nine-piece order is missing.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task ThreeGiftBoxWorkbookAppendPreservesConfirmation()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-three-box-append-{Guid.NewGuid():N}.xlsx");
+    var at = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    OrderChangeEntry Entry(string id, string orderNo, decimal quantity) =>
+        new(id, at, "site1", "網站1－睿驛", orderNo, "parent:A", "蝦皮賣場",
+            "2026/08/04 08:00:00", "2026-08-24", "4710964232435", "蛋黃酥小禮盒",
+            0m, quantity, quantity, "新增", "F", "待處理", false, string.Empty);
+
+    try
+    {
+        var first = Entry("ID-1", "ORDER-1", 2m);
+        var second = Entry("ID-2", "ORDER-2", -1m);
+        GiftBoxWorkbookExporter.Export(path, [first]);
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            var sheet = archive.GetEntry("xl/worksheets/sheet1.xml")
+                ?? throw new InvalidOperationException("Three-piece worksheet is missing.");
+            XDocument document;
+            using (var input = sheet.Open()) document = XDocument.Load(input);
+            XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            document.Descendants(spreadsheet + "c")
+                .Single(cell => (string?)cell.Attribute("r") == "E2")
+                .Descendants(spreadsheet + "t").Single().Value = "已確認";
+            sheet.Delete();
+            var replacement = archive.CreateEntry("xl/worksheets/sheet1.xml");
+            using var output = replacement.Open();
+            document.Save(output);
+        }
+
+        GiftBoxWorkbookExporter.Export(path, [first, second]);
+        using var resultArchive = ZipFile.OpenRead(path);
+        using var stream = (resultArchive.GetEntry("xl/worksheets/sheet1.xml")
+                            ?? throw new InvalidOperationException("Three-piece worksheet is missing after append.")).Open();
+        var result = XDocument.Load(stream);
+        XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        Equal("已確認", result.Descendants(ns + "c")
+            .Single(cell => (string?)cell.Attribute("r") == "E2")
+            .Descendants(ns + "t").Single().Value, "Manual confirmation was overwritten.");
+        Equal("-1", result.Descendants(ns + "c")
+            .Single(cell => (string?)cell.Attribute("r") == "D3")
+            .Element(ns + "v")?.Value, "Appended negative quantity is not numeric.");
+        Equal(1, result.ToString().Split("ID-1", StringSplitOptions.None).Length - 1,
+            "Existing row was duplicated during append.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task GiftBoxSizeUsesEggYolkCountNotOtherMultipliers()
+{
+    Equal(3, GiftBoxSizePolicy.Resolve("4710964232435", "芝初黑芝麻Q潤蛋黃酥小禮盒"),
+        "Three-piece SKU mapping is incorrect.");
+    Equal(6, GiftBoxSizePolicy.Resolve(null,
+        "預購_黑芝麻Q潤蛋黃酥禮盒(每盒含蛋黃酥x6)_8/22出貨"),
+        "Six-piece parent name was not recognized.");
+    Equal(9, GiftBoxSizePolicy.Resolve(null,
+        "黑芝麻Q潤蛋黃酥大禮盒(內含9入蛋黃酥+芝麻粉7g/包 x3)"),
+        "Sesame-powder multiplier incorrectly overrode the nine-piece count.");
+    Equal(null, GiftBoxSizePolicy.Resolve(null, "黑芝麻Q潤蛋黃酥 單入包裝 蛋奶素"),
+        "Single-piece item should not enter the three gift-box sheets.");
     return Task.CompletedTask;
 }
 
