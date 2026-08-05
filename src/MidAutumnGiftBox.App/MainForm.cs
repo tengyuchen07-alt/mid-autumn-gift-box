@@ -80,6 +80,7 @@ internal sealed class MainForm : Form
     private readonly CredentialManager _credentialManager = new(new WindowsCredentialVault());
     private readonly SyncStatusStore _syncStatusStore;
     private readonly OrderSnapshotStore _orderSnapshotStore;
+    private readonly OrderChangeLedgerStore _orderChangeLedgerStore;
     private readonly WmsApiClient _wmsClient;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
     private PreviewResult? _lastPreview;
@@ -97,6 +98,10 @@ internal sealed class MainForm : Form
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "MidAutumnGiftBox",
             "order-snapshot.json"));
+        _orderChangeLedgerStore = new OrderChangeLedgerStore(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MidAutumnGiftBox",
+            "order-change-ledger.json"));
 
         Text = "中秋禮盒－WMS 資料預覽";
         StartPosition = FormStartPosition.CenterScreen;
@@ -114,9 +119,9 @@ internal sealed class MainForm : Form
         _saveButton.Click += async (_, _) => await SaveCredentialsAsync();
         _shopsButton.Click += async (_, _) => await LoadShopsAsync();
         _ordersButton.Click += async (_, _) => await LoadOrdersAsync();
-        _exportButton.Click += (_, _) => ExportPreview();
+        _exportButton.Click += async (_, _) => await ExportPreviewAsync();
         _orderRangeLabel.Text =
-            $"首次從 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd}；之後從最後成功日包含式同步，到貨日可空白";
+            $"每次依訂單成立日重抓 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd} 至本次執行日；到貨日可空白";
 
         Shown += async (_, _) => await LoadCredentialStatusAsync();
     }
@@ -317,6 +322,48 @@ internal sealed class MainForm : Form
                 }
 
                 var finishedAt = DateTimeOffset.Now;
+                var allPreviousLines = await _orderSnapshotStore.GetAllAsync();
+                var previousLines = allPreviousLines
+                    .Where(line => line.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                var currentLines = OrderSnapshotStore.BuildSourceSnapshot(
+                    source.Code, result.Rows, finishedAt);
+                var currentOrderNumbers = currentLines
+                    .Select(line => line.ExternalOrderNo)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var departedOrderNumbers = previousLines
+                    .Select(line => line.ExternalOrderNo)
+                    .Where(orderNo => !currentOrderNumbers.Contains(orderNo))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                var departedStatuses = new Dictionary<string, OrderStatusResolution>(
+                    StringComparer.OrdinalIgnoreCase);
+                foreach (var orderNumber in departedOrderNumbers)
+                {
+                    var statusResult = await _wmsClient.GetOrderByNumberAsync(
+                        source, credentials, orderNumber);
+                    if (!statusResult.IsSuccess)
+                    {
+                        throw new WmsApiException(statusResult.Message);
+                    }
+
+                    var statusRow = statusResult.Rows.FirstOrDefault();
+                    departedStatuses[orderNumber] = new OrderStatusResolution(
+                        orderNumber,
+                        GetRowValue(statusRow, "status_code"),
+                        GetRowValue(statusRow, "status_name"));
+                }
+
+                var existingLedger = await _orderChangeLedgerStore.GetAllAsync();
+                var hasSourceLedger = existingLedger.Any(entry =>
+                    entry.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase));
+                var changeEntries = OrderChangePlanner.Plan(
+                    source.Name,
+                    hasSourceLedger ? previousLines : Array.Empty<OrderLineSnapshot>(),
+                    currentLines,
+                    departedStatuses,
+                    finishedAt);
+                await _orderChangeLedgerStore.AppendAsync(changeEntries);
                 await _orderSnapshotStore.ReplaceSourceAsync(
                     source.Code,
                     result.Rows,
@@ -334,7 +381,7 @@ internal sealed class MainForm : Form
                         result.Metadata.RowCount));
                     await LoadSyncStatusAsync(source.Code);
                     await LoadCommittedPreviewAsync(source);
-                    return result.Message + "；本機訂單快照已更新。";
+                    return result.Message + $"；本機訂單快照已更新，追加 {changeEntries.Count} 筆異動紀錄。";
                 }
                 catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
                 {
@@ -429,12 +476,17 @@ internal sealed class MainForm : Form
                 .ToArray();
             if (sourceLines.Length == 0)
             {
-                _lastPreview = null;
-                _exportButton.Enabled = false;
-                _grid.DataSource = null;
-                _jsonBox.Clear();
-                _previewMetadataLabel.Text = "此來源尚無已提交訂單快照。";
-                return;
+                var hasChangeHistory = (await _orderChangeLedgerStore.GetAllAsync()).Any(entry =>
+                    entry.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase));
+                if (!hasChangeHistory)
+                {
+                    _lastPreview = null;
+                    _exportButton.Enabled = false;
+                    _grid.DataSource = null;
+                    _jsonBox.Clear();
+                    _previewMetadataLabel.Text = "此來源尚無已提交訂單快照。";
+                    return;
+                }
             }
 
             SyncSourceStatus? status = null;
@@ -519,12 +571,12 @@ internal sealed class MainForm : Form
             "/api_v1/order/order_query.php",
             StringComparison.OrdinalIgnoreCase);
         _lastPreview = isOrderPreview ? result : null;
-        _exportButton.Enabled = isOrderPreview && result.Rows.Count > 0;
+        _exportButton.Enabled = isOrderPreview;
     }
 
-    private void ExportPreview()
+    private async Task ExportPreviewAsync()
     {
-        if (_lastPreview is null || _lastPreview.Rows.Count == 0)
+        if (_lastPreview is null)
         {
             MessageBox.Show(this, "請先載入有資料的預覽，再匯出 Excel。", "尚無可匯出資料",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -535,7 +587,7 @@ internal sealed class MainForm : Form
             .Where(character => !Path.GetInvalidFileNameChars().Contains(character)));
         using var dialog = new SaveFileDialog
         {
-            Title = "匯出預覽資料",
+            Title = "建立或追加中秋禮盒 Excel",
             Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
             DefaultExt = "xlsx",
             AddExtension = true,
@@ -550,13 +602,17 @@ internal sealed class MainForm : Form
 
         try
         {
-            PreviewWorkbookExporter.Export(dialog.FileName, _lastPreview);
+            var changeEntries = await _orderChangeLedgerStore.GetAllAsync();
+            PreviewWorkbookExporter.Export(dialog.FileName, _lastPreview, changeEntries);
             _statusLabel.Text = $"Excel 已匯出：{dialog.FileName}";
-            MessageBox.Show(this, "Excel 匯出完成。\n包含「訂單預覽」與「商品明細」兩張工作表。",
+            MessageBox.Show(this,
+                "Excel 匯出完成。\n包含「訂單預覽」、「商品明細」與追加式「異動紀錄」。\n" +
+                "再次選取同一檔案時，只會補上新異動，既有「確認」內容會保留。",
                 "匯出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
-                                          InvalidOperationException or ArgumentException or System.Xml.XmlException)
+                                          InvalidOperationException or ArgumentException or System.Xml.XmlException or
+                                          System.Text.Json.JsonException)
         {
             _statusLabel.Text = "Excel 匯出失敗";
             MessageBox.Show(this, $"無法匯出 Excel：{exception.Message}", "匯出失敗",
@@ -588,6 +644,18 @@ internal sealed class MainForm : Form
         }
 
         return table;
+    }
+
+    private static string? GetRowValue(
+        IReadOnlyDictionary<string, string?>? row,
+        string name)
+    {
+        if (row is null)
+        {
+            return null;
+        }
+
+        return row.FirstOrDefault(pair => pair.Key.Equals(name, StringComparison.OrdinalIgnoreCase)).Value;
     }
 
     private async Task RunBusyAsync(string busyMessage, Func<Task<string>> action)

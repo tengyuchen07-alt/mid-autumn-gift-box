@@ -73,7 +73,7 @@ public sealed class OrderSnapshotStore
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceCode);
         ArgumentNullException.ThrowIfNull(rows);
-        var replacement = ExpandRows(sourceCode, rows, synchronizedAt);
+        var replacement = BuildSourceSnapshot(sourceCode, rows, synchronizedAt);
         EnsureUniqueKeys(replacement);
 
         await _fileLock.WaitAsync(cancellationToken);
@@ -111,7 +111,7 @@ public sealed class OrderSnapshotStore
             throw new ArgumentException("增量快照查詢迄日不可早於起日。");
         }
 
-        var replacement = ExpandRows(sourceCode, rows, synchronizedAt);
+        var replacement = BuildSourceSnapshot(sourceCode, rows, synchronizedAt);
         EnsureUniqueKeys(replacement);
         foreach (var line in replacement)
         {
@@ -159,11 +159,13 @@ public sealed class OrderSnapshotStore
         }
     }
 
-    private static IReadOnlyList<OrderLineSnapshot> ExpandRows(
+    public static IReadOnlyList<OrderLineSnapshot> BuildSourceSnapshot(
         string sourceCode,
         IReadOnlyList<IReadOnlyDictionary<string, string?>> rows,
         DateTimeOffset synchronizedAt)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceCode);
+        ArgumentNullException.ThrowIfNull(rows);
         var result = new List<OrderLineSnapshot>();
         foreach (var row in rows)
         {

@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
 using MidAutumnGiftBox.Core;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -32,6 +33,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("同步 checkpoint 不會縮短待處理訂單的完整成立日範圍", SyncWindowKeepsFullOrderDateRange),
     ("增量快照只取代來源的訂單成立日範圍", IncrementalSnapshotReplacesOnlyQueriedOrderDates),
     ("增量訂單 API 會送出明確的成立日起訖", ExplicitOrderRangeIsSentToWms),
+    ("離開待處理的訂單可依訂單編號查回最終狀態", OrderStatusCanBeQueriedByOrderNumber),
+    ("同步差異只以父商品數量產生追加紀錄", ParentQuantityChangesBecomeAppendOnlyEntries),
+    ("離開待處理後只有取消退貨沖銷且刪除併單待人工確認", DepartedOrdersUseResolvedStatusRules),
+    ("異動紀錄只追加且重試不會重複寫入", ChangeLedgerIsAppendOnlyAndIdempotent),
+    ("Excel 追加新異動時會保留人工確認欄", ExcelAppendPreservesManualConfirmation),
     ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
     ("最近同步失敗不會把最後提交快照標成失敗資料", FailedSyncKeepsCommittedPreviewValid),
     ("快照投影遇到孤立子商品會拒絕顯示", SnapshotPreviewRejectsOrphanItems),
@@ -1205,6 +1211,206 @@ static async Task ExplicitOrderRangeIsSentToWms()
         new DateOnly(2026, 8, 4),
         new DateOnly(2026, 8, 5));
     True(result.IsSuccess, "Explicit incremental range query should succeed.");
+}
+
+static async Task OrderStatusCanBeQueriedByOrderNumber()
+{
+    var handler = new RecordingHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath == "/api_v1/token/authorize.php")
+        {
+            return Json("{\"result\":{\"ok\":true,\"access_token\":\"token\"}}");
+        }
+
+        Contains("order_no=2607303JVTVQVW", request.RequestUri.Query,
+            "Order-number status query did not send the exact order number.");
+        DoesNotContain("status=F", request.RequestUri.Query,
+            "Order-number status query must not hide cancelled orders behind the pending filter.");
+        return Json("""
+            {"result":{"ok":true},"data":{"total":1,"rows":[{
+              "order_no":"2607303JVTVQVW","status_code":"N","status_name":"已取消",
+              "order_date":"2026/07/30 23:09:33","products":[]
+            }]}}
+            """);
+    });
+    var client = new WmsApiClient(new HttpClient(handler));
+
+    var result = await client.GetOrderByNumberAsync(
+        new WmsSource("site1", "網站1", new Uri("https://example.test")),
+        new ApiCredentials("id", "key"),
+        "2607303JVTVQVW");
+
+    True(result.IsSuccess, "Order-number status query should succeed.");
+    Equal(1, result.Rows.Count, "Exact order-number query should return one order.");
+    Equal("N", result.Rows[0]["status_code"], "Cancelled status was not preserved.");
+}
+
+static Task ParentQuantityChangesBecomeAppendOnlyEntries()
+{
+    var previousAt = new DateTimeOffset(2026, 8, 4, 9, 0, 0, TimeSpan.FromHours(8));
+    var observedAt = previousAt.AddDays(1);
+    OrderLineSnapshot Line(string orderNo, string lineKey, string sku, decimal quantity, string level = "parent") =>
+        new("site1", orderNo, lineKey, level, level == "item" ? "parent:A" : null,
+            "shopee", "賣場", "2026/08/04 08:00:00", null, "2026-08-24",
+            sku, null, sku + " 商品", null, quantity, 0m, "F", previousAt,
+            "蝦皮賣場");
+
+    var previous = new[]
+    {
+        Line("UP", "parent:A", "SKU-UP", 2m),
+        Line("DOWN", "parent:A", "SKU-DOWN", 5m),
+        Line("REMOVE", "parent:A", "SKU-REMOVE", 4m),
+        Line("REMOVE", "parent:B", "SKU-KEEP", 1m),
+        Line("UP", "item:parent:A:I", "CHILD", 9m, "item")
+    };
+    var current = new[]
+    {
+        Line("UP", "parent:A", "SKU-UP", 5m),
+        Line("DOWN", "parent:A", "SKU-DOWN", 2m),
+        Line("REMOVE", "parent:B", "SKU-KEEP", 1m),
+        Line("NEW", "parent:A", "SKU-NEW", 6m),
+        Line("UP", "item:parent:A:I", "CHILD", 18m, "item")
+    };
+
+    var entries = OrderChangePlanner.Plan(
+        "網站1－睿驛", previous, current,
+        new Dictionary<string, OrderStatusResolution>(StringComparer.OrdinalIgnoreCase), observedAt);
+
+    Equal(4, entries.Count, "Only four parent-product changes should be appended.");
+    Equal(3m, entries.Single(entry => entry.ExternalOrderNo == "UP").QuantityChange,
+        "Parent increase should append only the positive difference.");
+    Equal(-3m, entries.Single(entry => entry.ExternalOrderNo == "DOWN").QuantityChange,
+        "Parent decrease should append only the negative difference.");
+    Equal(-4m, entries.Single(entry => entry.ExternalOrderNo == "REMOVE").QuantityChange,
+        "Removing one product from a still-pending order should reverse that product quantity.");
+    Equal(6m, entries.Single(entry => entry.ExternalOrderNo == "NEW").QuantityChange,
+        "A new parent product should append its full quantity.");
+    True(entries.All(entry => entry.Confirmation == string.Empty),
+        "Program-created confirmation cells must remain blank.");
+    return Task.CompletedTask;
+}
+
+static Task DepartedOrdersUseResolvedStatusRules()
+{
+    var synchronizedAt = new DateTimeOffset(2026, 8, 4, 9, 0, 0, TimeSpan.FromHours(8));
+    OrderLineSnapshot Line(string orderNo, decimal quantity) =>
+        new("site1", orderNo, "parent:A", "parent", null,
+            "shopee", "賣場", "2026/08/04 08:00:00", null, "2026-08-24",
+            "SKU-" + orderNo, null, orderNo + " 商品", null, quantity, 0m, "F", synchronizedAt,
+            "蝦皮賣場");
+    var previous = new[]
+    {
+        Line("CANCEL", 2m),
+        Line("RETURN", 3m),
+        Line("DELETE", 4m),
+        Line("SHIPPED", 5m)
+    };
+    var statuses = new Dictionary<string, OrderStatusResolution>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["CANCEL"] = new("CANCEL", "N", "已取消"),
+        ["RETURN"] = new("RETURN", "R", "已退貨"),
+        ["DELETE"] = new("DELETE", "D", "已封存"),
+        ["SHIPPED"] = new("SHIPPED", "S", "已出貨")
+    };
+
+    var entries = OrderChangePlanner.Plan(
+        "網站1－睿驛", previous, Array.Empty<OrderLineSnapshot>(), statuses,
+        synchronizedAt.AddDays(1));
+
+    Equal(3, entries.Count, "Shipped orders must not create a cancellation adjustment.");
+    var cancelled = entries.Single(entry => entry.ExternalOrderNo == "CANCEL");
+    Equal(-2m, cancelled.QuantityChange, "Cancelled order should reverse the remaining parent quantity.");
+    Equal("取消", cancelled.ChangeType, "Cancelled order should be labelled as cancellation.");
+    var returned = entries.Single(entry => entry.ExternalOrderNo == "RETURN");
+    Equal(-3m, returned.QuantityChange, "Returned order should reverse the remaining parent quantity.");
+    var deleted = entries.Single(entry => entry.ExternalOrderNo == "DELETE");
+    Equal(0m, deleted.QuantityChange, "Deleted or merged order must not change quantity automatically.");
+    True(deleted.NeedsReview, "Deleted or merged order should be marked for manual review.");
+    return Task.CompletedTask;
+}
+
+static async Task ChangeLedgerIsAppendOnlyAndIdempotent()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-ledger-{Guid.NewGuid():N}");
+    var store = new OrderChangeLedgerStore(Path.Combine(directory, "order-change-ledger.json"));
+    var at = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    OrderChangeEntry Entry(string id, string orderNo, decimal change) =>
+        new(id, at, "site1", "網站1－睿驛", orderNo, "parent:A", "蝦皮賣場",
+            "2026/08/04 08:00:00", "2026-08-24", "SKU", "蛋黃酥禮盒",
+            change < 0 ? -change : 0m, change > 0 ? change : 0m, change,
+            change < 0 ? "取消" : "新增", change < 0 ? "N" : "F",
+            change < 0 ? "已取消" : "待處理", false, string.Empty);
+
+    try
+    {
+        var first = Entry("E1", "ORDER-1", 2m);
+        var second = Entry("E2", "ORDER-2", -1m);
+        await store.AppendAsync([first]);
+        await new OrderChangeLedgerStore(Path.Combine(directory, "order-change-ledger.json"))
+            .AppendAsync([first, second]);
+
+        var saved = await store.GetAllAsync();
+        Equal(2, saved.Count, "Retrying the same change should not duplicate a ledger row.");
+        Equal("E1", saved[0].EntryId, "Existing ledger history was overwritten.");
+        Equal("E2", saved[1].EntryId, "New ledger entry was not appended after existing history.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static Task ExcelAppendPreservesManualConfirmation()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-ledger-{Guid.NewGuid():N}.xlsx");
+    var at = new DateTimeOffset(2026, 8, 5, 9, 0, 0, TimeSpan.FromHours(8));
+    var preview = new PreviewResult(true, "ok", Array.Empty<IReadOnlyDictionary<string, string?>>(), "{}",
+        new PreviewMetadata("網站1－睿驛", "/api_v1/order/order_query.php", at, 200, 1, 0, true, "ok"));
+    OrderChangeEntry Entry(string id, string orderNo) =>
+        new(id, at, "site1", "網站1－睿驛", orderNo, "parent:A", "蝦皮賣場",
+            "2026/08/04 08:00:00", "2026-08-24", "SKU", "蛋黃酥禮盒",
+            0m, 2m, 2m, "新增", "F", "待處理", false, string.Empty);
+
+    try
+    {
+        var first = Entry("ENTRY-1", "ORDER-1");
+        var second = Entry("ENTRY-2", "ORDER-2");
+        PreviewWorkbookExporter.Export(path, preview, [first]);
+
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            var entry = archive.GetEntry("xl/worksheets/sheet3.xml")
+                ?? throw new InvalidOperationException("Change worksheet is missing.");
+            XDocument document;
+            using (var stream = entry.Open()) document = XDocument.Load(stream);
+            XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            var confirmationCell = document.Descendants(spreadsheet + "c")
+                .Single(cell => (string?)cell.Attribute("r") == "P2");
+            confirmationCell.Descendants(spreadsheet + "t").Single().Value = "已確認";
+            entry.Delete();
+            var replacement = archive.CreateEntry("xl/worksheets/sheet3.xml");
+            using var output = replacement.Open();
+            document.Save(output);
+        }
+
+        PreviewWorkbookExporter.Export(path, preview, [first, second]);
+        using var resultArchive = ZipFile.OpenRead(path);
+        var resultEntry = resultArchive.GetEntry("xl/worksheets/sheet3.xml")
+            ?? throw new InvalidOperationException("Change worksheet is missing after append.");
+        using var reader = new StreamReader(resultEntry.Open(), Encoding.UTF8);
+        var xml = reader.ReadToEnd();
+        Contains("確認", xml, "Change worksheet does not contain the confirmation column.");
+        Contains("已確認", xml, "Manual confirmation was overwritten during append.");
+        Contains("ENTRY-2", xml, "New change row was not appended.");
+        Equal(1, xml.Split("ENTRY-1", StringSplitOptions.None).Length - 1,
+            "Existing change row was duplicated during append.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
 }
 
 static Task SourceSyncLockIsExclusive()

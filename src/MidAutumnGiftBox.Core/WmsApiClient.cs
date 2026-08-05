@@ -36,6 +36,27 @@ public sealed class WmsApiClient
             cancellationToken);
     }
 
+    public async Task<PreviewResult> GetOrderByNumberAsync(
+        WmsSource source,
+        ApiCredentials credentials,
+        string orderNumber,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(orderNumber);
+        var normalizedOrderNumber = orderNumber.Trim();
+        var path = "/api_v1/order/order_query.php" +
+                   $"?order_no={Uri.EscapeDataString(normalizedOrderNumber)}&nowpage=1&pagesize=50";
+        return await GetPreviewAsync(
+            source,
+            credentials,
+            path,
+            cancellationToken,
+            row => string.Equals(
+                GetElementString(row, "order_no"),
+                normalizedOrderNumber,
+                StringComparison.OrdinalIgnoreCase));
+    }
+
     public Task<PreviewResult> GetPendingOrdersSinceInitialDateAsync(
         WmsSource source,
         ApiCredentials credentials,
@@ -446,6 +467,26 @@ public sealed class WmsApiClient
     private static string? FindKey(JsonObject obj, string name) =>
         obj.Select(property => property.Key)
             .FirstOrDefault(key => key.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    private static string? GetElementString(JsonElement element, string name)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var property in element.EnumerateObject())
+        {
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                return property.Value.ValueKind == JsonValueKind.String
+                    ? property.Value.GetString()
+                    : property.Value.ToString();
+            }
+        }
+
+        return null;
+    }
 
     private static string? GetString(JsonObject obj, string name)
     {
