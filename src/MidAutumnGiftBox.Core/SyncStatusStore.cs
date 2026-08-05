@@ -129,6 +129,10 @@ public sealed class SyncStatusStore
         await _fileLock.WaitAsync(cancellationToken);
         try
         {
+            var directory = Path.GetDirectoryName(_path)
+                ?? throw new InvalidOperationException("同步狀態檔案缺少目錄。");
+            using var dataLock = await SourceSyncFileLock.AcquireAsync(
+                directory, "sync-status-data", TimeSpan.FromSeconds(10), cancellationToken);
             var statuses = await LoadAsync(cancellationToken);
             statuses.TryGetValue(sourceCode, out var previous);
             statuses[sourceCode] = update(previous);
