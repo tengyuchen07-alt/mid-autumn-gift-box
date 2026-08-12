@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace MidAutumnGiftBox.Core;
@@ -30,7 +32,10 @@ public sealed record OrderLineSnapshot(
     string? ShippingDateStatus = null,
     string? ProductType = null,
     string? StatusName = null,
-    string? TotalPrice = null);
+    string? TotalPrice = null,
+    string? OperationalDiagnosticFields = null,
+    string? OperationalDiagnostics = null,
+    string? Note = null);
 
 public sealed class OrderSnapshotStore
 {
@@ -89,6 +94,30 @@ public sealed class OrderSnapshotStore
                 .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             await SaveAsync(combined, cancellationToken);
+        }
+        finally
+        {
+            _fileLock.Release();
+        }
+    }
+
+    public async Task ReplaceAllAsync(
+        IReadOnlyList<OrderLineSnapshot> replacement,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        EnsureUniqueKeys(replacement);
+        var ordered = replacement
+            .OrderBy(line => line.SourceCode, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(line => line.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        await _fileLock.WaitAsync(cancellationToken);
+        try
+        {
+            using var dataLock = await AcquireDataFileLockAsync(cancellationToken);
+            await SaveAsync(ordered, cancellationToken);
         }
         finally
         {
@@ -313,7 +342,10 @@ public sealed class OrderSnapshotStore
             GetProductOrRowValue(shippingProduct, row, "shipping_date_status"),
             GetScalarText(product, "type"),
             GetRowValue(row, "status_name"),
-            GetRowValue(row, "total_price"));
+            GetRowValue(row, "total_price"),
+            GetRowValue(row, "operational_diagnostic_fields"),
+            GetRowValue(row, "operational_diagnostics"),
+            GetRowValue(row, "note"));
 
     private async Task<List<OrderLineSnapshot>> LoadAsync(CancellationToken cancellationToken)
     {
@@ -366,15 +398,25 @@ public sealed class OrderSnapshotStore
     private static (string Key, string? Value) GetIdentity(JsonElement product, int index)
     {
         var itemNo = GetScalarText(product, "item_no")?.Trim();
-        if (!string.IsNullOrWhiteSpace(itemNo))
+        var sku = GetScalarText(product, "sku")?.Trim();
+        var name = GetScalarText(product, "name")?.Trim();
+        var spec = GetScalarText(product, "spec")?.Trim();
+        var baseKey = !string.IsNullOrWhiteSpace(itemNo)
+            ? $"item_no:{itemNo}"
+            : !string.IsNullOrWhiteSpace(sku)
+                ? $"sku:{sku}"
+                : !string.IsNullOrWhiteSpace(name) || !string.IsNullOrWhiteSpace(spec)
+                    ? "description"
+                    : $"index:{index}";
+        var identityText = string.Join("\u001f", itemNo, sku, name, spec);
+        if (identityText.Replace("\u001f", string.Empty).Length == 0)
         {
-            return ($"item_no:{itemNo}", itemNo);
+            return (baseKey, null);
         }
 
-        var sku = GetScalarText(product, "sku")?.Trim();
-        return !string.IsNullOrWhiteSpace(sku)
-            ? ($"sku:{sku}", sku)
-            : ($"index:{index}", null);
+        var detailHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(identityText)))[..16];
+        return ($"{baseKey}:detail:{detailHash}", itemNo ?? sku);
     }
 
     private static int NextOccurrence(IDictionary<string, int> occurrences, string identity)

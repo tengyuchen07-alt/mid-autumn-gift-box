@@ -88,6 +88,9 @@ public static class OrderSnapshotPreviewBuilder
                 ["status_code"] = representative.StatusCode,
                 ["status_name"] = representative.StatusName,
                 ["total_price"] = representative.TotalPrice,
+                ["note"] = representative.Note,
+                ["operational_diagnostic_fields"] = representative.OperationalDiagnosticFields,
+                ["operational_diagnostics"] = representative.OperationalDiagnostics,
                 ["products"] = products.ToJsonString(CompactJsonOptions)
             };
             rows.Add(row);

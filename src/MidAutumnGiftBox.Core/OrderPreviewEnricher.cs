@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -58,6 +59,11 @@ public static partial class OrderPreviewEnricher
         }
 
         MirrorConsistentProductShippingWindow(order, parentProducts);
+        if (CanApplyArrivalDateFallback(parentProducts))
+        {
+            ApplyArrivalDateFallback(order);
+            ApplyNoteDateFallback(order, fallbackYear);
+        }
     }
 
     private static void ApplyDerivedShippingWindow(JsonObject product, int? fallbackYear)
@@ -228,7 +234,11 @@ public static partial class OrderPreviewEnricher
                 continue;
             }
 
-            windows.Add(new ShippingWindow(start, end, shippingDate, source));
+            windows.Add(new ShippingWindow(
+                start,
+                end,
+                ShippingLeadTimePolicy.Adjust(shippingDate),
+                source));
         }
 
         return new WindowParseResult(
@@ -247,6 +257,72 @@ public static partial class OrderPreviewEnricher
         var match = YearRegex().Match(value);
         return match.Success && int.TryParse(match.Value, out var year) ? year : null;
     }
+
+    private static void ApplyArrivalDateFallback(JsonObject order)
+    {
+        if (!string.IsNullOrWhiteSpace(GetString(order, "derived_shipping_date")))
+        {
+            return;
+        }
+
+        var value = GetString(order, "arrival_date");
+        string[] formats = ["yyyy/M/d", "yyyy/MM/dd", "yyyy-M-d", "yyyy-MM-dd"];
+        if (!DateOnly.TryParseExact(
+                value,
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var originalDate))
+        {
+            return;
+        }
+
+        SetValue(order, "derived_shipping_date", ShippingLeadTimePolicy.Adjust(originalDate).ToString("yyyy-MM-dd"));
+        SetValue(order, "shipping_date_source", "order.arrival_date");
+        SetValue(order, "shipping_date_status", "derived");
+    }
+
+    private static void ApplyNoteDateFallback(JsonObject order, int? fallbackYear)
+    {
+        if (!string.IsNullOrWhiteSpace(GetString(order, "derived_shipping_date")) ||
+            fallbackYear is null)
+        {
+            return;
+        }
+
+        var result = ParseWindows(GetString(order, "note") ?? string.Empty, fallbackYear.Value, "order.note");
+        var distinct = result.Windows
+            .DistinctBy(candidate => (candidate.Start, candidate.End, candidate.ShippingDate))
+            .ToArray();
+        if (result.HasMultipleExplicitRanges || distinct.Length > 1)
+        {
+            SetValue(order, "shipping_date_status", "conflict");
+            return;
+        }
+
+        if (result.Status == WindowParseStatus.Invalid)
+        {
+            SetValue(order, "shipping_date_status", "needs_review");
+            return;
+        }
+
+        if (distinct.Length != 1)
+        {
+            return;
+        }
+
+        var selected = distinct[0];
+        SetValue(order, "ship_window_start", selected.Start.ToString("yyyy-MM-dd"));
+        SetValue(order, "ship_window_end", selected.End.ToString("yyyy-MM-dd"));
+        SetValue(order, "derived_shipping_date", selected.ShippingDate.ToString("yyyy-MM-dd"));
+        SetValue(order, "shipping_date_source", selected.Source);
+        SetValue(order, "shipping_date_status", "derived");
+    }
+
+    private static bool CanApplyArrivalDateFallback(IReadOnlyList<JsonObject> products) =>
+        products.All(product =>
+            string.IsNullOrWhiteSpace(GetString(product, "derived_shipping_date")) &&
+            GetString(product, "shipping_date_status") is not ("conflict" or "needs_review"));
 
     private static string? FindKey(JsonObject obj, string name) =>
         obj.Select(property => property.Key)

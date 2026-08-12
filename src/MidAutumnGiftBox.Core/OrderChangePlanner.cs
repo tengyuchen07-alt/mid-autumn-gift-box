@@ -27,7 +27,17 @@ public sealed record OrderChangeEntry(
     string? StatusCode,
     string? StatusName,
     bool NeedsReview,
-    string Confirmation = "");
+    string Confirmation = "",
+    string? OriginalDeliveryDate = null,
+    int? GiftBoxSize = null,
+    string? Note = null,
+    string? SourceLocation = null,
+    bool HasManualLocation = false,
+    bool HasManualConfirmation = false,
+    bool HasManualOriginalDeliveryDate = false,
+    bool HasManualOrderDate = false,
+    bool IgnoreExistingLocation = false,
+    bool IgnoreExistingConfirmation = false);
 
 public static class OrderChangePlanner
 {
@@ -66,7 +76,7 @@ public static class OrderChangePlanner
 
             entries.Add(CreateEntry(
                 sourceName,
-                previousLine ?? currentLine,
+                currentLine,
                 oldQuantity,
                 currentLine.Quantity,
                 change,
@@ -74,7 +84,8 @@ public static class OrderChangePlanner
                 currentLine.StatusCode,
                 currentLine.StatusName,
                 needsReview: false,
-                observedAt));
+                observedAt,
+                current));
         }
 
         foreach (var previousLine in oldParents.Values.Where(line => !newParents.ContainsKey(LineKey(line))))
@@ -91,7 +102,8 @@ public static class OrderChangePlanner
                     "F",
                     "待處理",
                     needsReview: false,
-                    observedAt));
+                    observedAt,
+                    previous));
                 continue;
             }
 
@@ -102,27 +114,27 @@ public static class OrderChangePlanner
                 case "N":
                     entries.Add(CreateEntry(
                         sourceName, previousLine, previousLine.Quantity, 0m, -previousLine.Quantity,
-                        "取消", statusCode, resolution?.StatusName, needsReview: false, observedAt));
+                        "取消", statusCode, resolution?.StatusName, needsReview: false, observedAt, previous));
                     break;
                 case "R":
                     entries.Add(CreateEntry(
                         sourceName, previousLine, previousLine.Quantity, 0m, -previousLine.Quantity,
-                        "退貨", statusCode, resolution?.StatusName, needsReview: false, observedAt));
+                        "退貨", statusCode, resolution?.StatusName, needsReview: false, observedAt, previous));
                     break;
                 case "D":
                     entries.Add(CreateEntry(
                         sourceName, previousLine, previousLine.Quantity, previousLine.Quantity, 0m,
-                        "刪除或併單待確認", statusCode, resolution?.StatusName, needsReview: true, observedAt));
+                        "刪除或併單待確認", statusCode, resolution?.StatusName, needsReview: true, observedAt, previous));
                     break;
                 case "F":
                     entries.Add(CreateEntry(
                         sourceName, previousLine, previousLine.Quantity, 0m, -previousLine.Quantity,
-                        "品項移除", statusCode, resolution?.StatusName, needsReview: false, observedAt));
+                        "品項移除", statusCode, resolution?.StatusName, needsReview: false, observedAt, previous));
                     break;
                 case null or "":
                     entries.Add(CreateEntry(
                         sourceName, previousLine, previousLine.Quantity, previousLine.Quantity, 0m,
-                        "狀態待確認", statusCode, resolution?.StatusName, needsReview: true, observedAt));
+                        "狀態待確認", statusCode, resolution?.StatusName, needsReview: true, observedAt, previous));
                     break;
                 // W/P/C/S/T/A and other known workflow states do not reverse factory demand.
             }
@@ -151,7 +163,8 @@ public static class OrderChangePlanner
         string? statusCode,
         string? statusName,
         bool needsReview,
-        DateTimeOffset observedAt)
+        DateTimeOffset observedAt,
+        IReadOnlyList<OrderLineSnapshot> sourceSnapshot)
     {
         var identity = string.Join("\u001f",
             line.SourceCode,
@@ -172,7 +185,7 @@ public static class OrderChangePlanner
             line.ExternalLineKey,
             line.ChannelName ?? line.ChannelCode,
             line.OrderDate,
-            line.DerivedShippingDate ?? line.ArrivalDate,
+            ResolveDeliveryDate(line),
             line.Sku,
             line.ProductName,
             previousQuantity,
@@ -182,6 +195,27 @@ public static class OrderChangePlanner
             statusCode,
             statusName,
             needsReview,
-            string.Empty);
+            string.Empty,
+            ResolveOriginalDeliveryDate(line),
+            ResolveGiftBoxSize(line, sourceSnapshot),
+            line.Note);
     }
+
+    private static int? ResolveGiftBoxSize(
+        OrderLineSnapshot parent,
+        IReadOnlyList<OrderLineSnapshot> sourceSnapshot) =>
+        GiftBoxSizePolicy.ResolveParent(parent, sourceSnapshot);
+
+    private static string? ResolveDeliveryDate(OrderLineSnapshot line) =>
+        ShippingLeadTimePolicy.Resolve(
+            line.DerivedShippingDate,
+            line.ArrivalDate,
+            line.ShippingDateStatus);
+
+    private static string? ResolveOriginalDeliveryDate(OrderLineSnapshot line) =>
+        ShippingLeadTimePolicy.ResolveOriginal(
+            line.ShipWindowStart,
+            line.ShipWindowEnd,
+            line.ArrivalDate,
+            line.ShippingDateStatus);
 }

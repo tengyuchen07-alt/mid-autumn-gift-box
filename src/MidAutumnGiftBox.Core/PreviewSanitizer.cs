@@ -23,13 +23,13 @@ public static class PreviewSanitizer
         "result", "ok", "rows", "data", "list", "total", "total_count",
         "maxpage", "nowpage", "pagesize",
         "shop_id", "shop_name", "shop_type", "shop_type_name",
-        "order_no", "order_date", "arrival_date", "shipping_date", "source", "source_id", "source_key",
+        "order_no", "order_date", "arrival_date", "shipping_date", "source", "source_id", "source_key", "note",
         "ship_window_start", "ship_window_end", "derived_shipping_date", "shipping_date_source", "shipping_date_status",
+        "operational_diagnostic_fields", "operational_diagnostics",
         "status_code", "status_name", "total_price", "products", "items",
         "sku", "item_no", "name", "spec", "price", "qty", "shipp_qty", "stock",
         "warehouse", "wh_id", "type"
     };
-
     public static string Sanitize(string json, Func<JsonElement, bool>? rowFilter = null)
     {
         using var document = JsonDocument.Parse(json);

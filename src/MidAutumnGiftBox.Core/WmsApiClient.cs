@@ -106,7 +106,11 @@ public sealed class WmsApiClient
                 }
             }
 
-            return isPending && GiftBoxProductPolicy.ContainsRelevantProduct(row);
+            var isExplicitFlavorNonPageOrder = isFlavor && string.Equals(
+                GetElementString(row, "logistics_code")?.Trim(),
+                "none",
+                StringComparison.OrdinalIgnoreCase);
+            return isPending && !isExplicitFlavorNonPageOrder && GiftBoxProductPolicy.ContainsRelevantProduct(row);
         }
 
         if (!credentials.IsComplete)
@@ -230,6 +234,11 @@ public sealed class WmsApiClient
             if (!string.Equals(GetString(order, "status_code"), "F", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
+            }
+
+            if (enableFlavorBom)
+            {
+                FlavorOperationalDiagnostics.Enrich(order);
             }
 
             var productsKey = FindKey(order, "products");

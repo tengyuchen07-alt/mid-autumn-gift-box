@@ -35,12 +35,15 @@ public static class GiftBoxProductPolicy
         var skuMatches = TryGetProperty(product, "sku", out var sku) &&
                          sku.ValueKind == JsonValueKind.String &&
                          TargetSkus.Contains(sku.GetString() ?? string.Empty);
+        var itemNoMatches = TryGetProperty(product, "item_no", out var itemNo) &&
+                            itemNo.ValueKind == JsonValueKind.String &&
+                            GiftBoxItemPolicy.TryResolve(itemNo.GetString(), out _);
         var nameMatches = TryGetProperty(product, "name", out var name) &&
                           name.ValueKind == JsonValueKind.String &&
                           (name.GetString() ?? string.Empty).Contains(
                               EggYolkPastryText,
                               StringComparison.OrdinalIgnoreCase);
-        if (skuMatches || nameMatches)
+        if (itemNoMatches || skuMatches || nameMatches)
         {
             return true;
         }

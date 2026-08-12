@@ -9,9 +9,12 @@ internal sealed class MainForm : Form
     private static readonly IReadOnlyDictionary<string, string> PreviewColumnNames =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
+            ["operational_diagnostic_fields"] = "Flavor 作業欄位名稱",
+            ["operational_diagnostics"] = "Flavor 安全作業診斷",
             ["source"] = "訂單來源",
             ["shop_name"] = "賣場名稱",
             ["source_key"] = "通路代碼",
+            ["note"] = "備註",
             ["order_no"] = "訂單編號",
             ["order_date"] = "訂單成立日",
             ["arrival_date"] = "指定到貨日（API）",
@@ -53,8 +56,12 @@ internal sealed class MainForm : Form
     };
     private readonly Button _saveButton = new() { Text = "安全保存憑證", AutoSize = true };
     private readonly Button _shopsButton = new() { Text = "取得店舖清單", AutoSize = true };
-    private readonly Button _ordersButton = new() { Text = "立即同步兩網站蛋黃酥訂單", AutoSize = true };
-    private readonly Button _exportButton = new() { Text = "匯出／追加三種禮盒 Excel", AutoSize = true };
+    private readonly Button _ordersButton = new() { Text = "重新載入完整訂單", AutoSize = true };
+    private readonly Button _exportButton = new() { Text = "匯出／更新禮盒 Excel", AutoSize = true };
+    private readonly Button _clearOverridesButton = new() { Text = "清除人工覆寫", AutoSize = true };
+    private readonly Button _loadErpFileButton = new() { Text = "選擇 ERP Excel", AutoSize = true };
+    private readonly Button _loadManualExcelButton = new() { Text = "選擇手打單 Excel", AutoSize = true };
+    private readonly Button _loadPosFileButton = new() { Text = "選擇 POS機 Excel", AutoSize = true };
     private readonly DataGridView _grid = new()
     {
         Dock = DockStyle.Fill,
@@ -65,42 +72,39 @@ internal sealed class MainForm : Form
         BackgroundColor = Color.White,
         BorderStyle = BorderStyle.None
     };
-    private readonly RichTextBox _jsonBox = new()
-    {
-        Dock = DockStyle.Fill,
-        ReadOnly = true,
-        Font = new Font("Consolas", 10F),
-        BackColor = Color.White,
-        BorderStyle = BorderStyle.None,
-        WordWrap = false
-    };
+    private readonly DataGridView _erpGrid = CreateImportGrid();
+    private readonly DataGridView _manualExcelGrid = CreateImportGrid();
+    private readonly DataGridView _posGrid = CreateImportGrid();
     private readonly ToolStripStatusLabel _statusLabel = new("準備就緒");
     private readonly ToolStripProgressBar _progress = new() { Style = ProgressBarStyle.Marquee, Visible = false };
 
     private readonly CredentialManager _credentialManager = new(new WindowsCredentialVault());
     private readonly SyncStatusStore _syncStatusStore;
     private readonly OrderSnapshotStore _orderSnapshotStore;
-    private readonly OrderChangeLedgerStore _orderChangeLedgerStore;
+    private readonly ManualOverrideStore _manualOverrideStore;
+    private readonly PosFirstImportStore _posFirstImportStore;
+    private readonly LocalHistoryResetService _historyResetService;
     private readonly WmsApiClient _wmsClient;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
+    private ImportedSpreadsheetBatch? _erpBatch;
+    private ImportedSpreadsheetBatch? _manualExcelBatch;
+    private ImportedSpreadsheetBatch? _posBatch;
 
     public MainForm()
     {
         var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("MidAutumnGiftBox/1.0");
         _wmsClient = new WmsApiClient(httpClient);
-        _syncStatusStore = new SyncStatusStore(Path.Combine(
+        var dataDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MidAutumnGiftBox",
-            "sync-status.json"));
-        _orderSnapshotStore = new OrderSnapshotStore(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MidAutumnGiftBox",
-            "order-snapshot.json"));
-        _orderChangeLedgerStore = new OrderChangeLedgerStore(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MidAutumnGiftBox",
-            "order-change-ledger.json"));
+            "MidAutumnGiftBox");
+        _syncStatusStore = new SyncStatusStore(Path.Combine(dataDirectory, "sync-status.json"));
+        _orderSnapshotStore = new OrderSnapshotStore(Path.Combine(dataDirectory, "order-snapshot.json"));
+        _manualOverrideStore = new ManualOverrideStore(Path.Combine(dataDirectory, "manual-overrides.json"));
+        _posFirstImportStore = new PosFirstImportStore(Path.Combine(dataDirectory, "pos-first-import.json"));
+        _historyResetService = new LocalHistoryResetService(
+            dataDirectory,
+            Sources.Select(source => source.Code).ToArray());
 
         Text = "中秋禮盒－WMS 資料預覽";
         StartPosition = FormStartPosition.CenterScreen;
@@ -119,10 +123,17 @@ internal sealed class MainForm : Form
         _shopsButton.Click += async (_, _) => await LoadShopsAsync();
         _ordersButton.Click += async (_, _) => await LoadAllOrdersAsync();
         _exportButton.Click += async (_, _) => await ExportPreviewAsync();
+        _clearOverridesButton.Click += async (_, _) => await ClearManualOverrideAsync();
+        _loadErpFileButton.Click += async (_, _) => await LoadSpreadsheetAsync(SpreadsheetImportKind.Erp);
+        _loadManualExcelButton.Click += async (_, _) => await LoadSpreadsheetAsync(SpreadsheetImportKind.Manual);
+        _loadPosFileButton.Click += async (_, _) => await LoadSpreadsheetAsync(SpreadsheetImportKind.Pos);
         _orderRangeLabel.Text =
             $"每次依訂單成立日重抓 {WmsQueryPolicy.InitialOrderDate:yyyy/MM/dd} 至本次執行日；到貨日可空白";
 
-        Shown += async (_, _) => await LoadCredentialStatusAsync();
+        Shown += async (_, _) =>
+        {
+            await LoadCredentialStatusAsync();
+        };
     }
 
     private Control BuildLayout()
@@ -187,21 +198,49 @@ internal sealed class MainForm : Form
             AutoSize = true,
             Dock = DockStyle.Top,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
+            WrapContents = true,
             Padding = new Padding(0, 4, 0, 8)
         };
         actionPanel.Controls.Add(_shopsButton);
         actionPanel.Controls.Add(_orderRangeLabel);
         actionPanel.Controls.Add(_ordersButton);
         actionPanel.Controls.Add(_exportButton);
+        actionPanel.Controls.Add(_clearOverridesButton);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         var tableTab = new TabPage("整理後表格") { BackColor = Color.White, Padding = new Padding(8) };
-        var jsonTab = new TabPage("安全遮罩 JSON") { BackColor = Color.White, Padding = new Padding(8) };
+        var manualTab = new TabPage("手打單") { BackColor = Color.White, Padding = new Padding(8) };
+        var erpTab = new TabPage("ERP") { BackColor = Color.White, Padding = new Padding(8) };
+        var posTab = new TabPage("POS機") { BackColor = Color.White, Padding = new Padding(8) };
         tableTab.Controls.Add(_grid);
-        jsonTab.Controls.Add(_jsonBox);
+        var manualLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        manualLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        manualLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var manualActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
+        manualActions.Controls.Add(_loadManualExcelButton);
+        manualLayout.Controls.Add(manualActions, 0, 0);
+        manualLayout.Controls.Add(_manualExcelGrid, 0, 1);
+        manualTab.Controls.Add(manualLayout);
+        var erpLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        erpLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        erpLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var erpActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
+        erpActions.Controls.Add(_loadErpFileButton);
+        erpLayout.Controls.Add(erpActions, 0, 0);
+        erpLayout.Controls.Add(_erpGrid, 0, 1);
+        erpTab.Controls.Add(erpLayout);
+        var posLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        posLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        posLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var posActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
+        posActions.Controls.Add(_loadPosFileButton);
+        posLayout.Controls.Add(posActions, 0, 0);
+        posLayout.Controls.Add(_posGrid, 0, 1);
+        posTab.Controls.Add(posLayout);
         tabs.TabPages.Add(tableTab);
-        tabs.TabPages.Add(jsonTab);
+        tabs.TabPages.Add(manualTab);
+        tabs.TabPages.Add(erpTab);
+        tabs.TabPages.Add(posTab);
 
         var status = new StatusStrip { SizingGrip = false };
         status.Items.Add(_statusLabel);
@@ -229,6 +268,17 @@ internal sealed class MainForm : Form
         AutoSize = true,
         Margin = new Padding(4, 8, 8, 0),
         ForeColor = Color.FromArgb(75, 85, 99)
+    };
+
+    private static DataGridView CreateImportGrid() => new()
+    {
+        Dock = DockStyle.Fill,
+        ReadOnly = true,
+        AllowUserToAddRows = false,
+        AllowUserToDeleteRows = false,
+        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.DisplayedCells,
+        BackgroundColor = Color.White,
+        BorderStyle = BorderStyle.None
     };
 
     private WmsSource SelectedSource => _sourceBox.SelectedItem as WmsSource
@@ -287,38 +337,80 @@ internal sealed class MainForm : Form
 
     private async Task LoadAllOrdersAsync()
     {
-        await RunBusyAsync("正在依序同步兩個網站的蛋黃酥訂單…", async () =>
+        await RunBusyAsync("正在重新載入兩個網站的完整蛋黃酥訂單…", async () =>
         {
-            var credentialsBySource = new Dictionary<string, ApiCredentials>(StringComparer.OrdinalIgnoreCase);
-            foreach (var source in Sources)
-            {
-                credentialsBySource[source.Code] = await ResolveCredentialsForSourceAsync(source);
-            }
-
-            var messages = new List<string>();
-            foreach (var source in Sources)
-            {
-                messages.Add(await SynchronizeSourceAsync(source, credentialsBySource[source.Code]));
-            }
-
-            var selected = SelectedSource;
-            await LoadSyncStatusAsync(selected.Code);
-            await LoadCommittedPreviewAsync(selected);
-            return $"兩個網站同步完成。{string.Join("　", messages)}";
+            var credentialsBySource = await ResolveAllCredentialsAsync();
+            return await SynchronizeAllSourcesAsync(credentialsBySource);
         });
     }
 
-    private async Task<string> SynchronizeSourceAsync(WmsSource source, ApiCredentials credentials)
+    private async Task<IReadOnlyDictionary<string, ApiCredentials>> ResolveAllCredentialsAsync()
     {
-        var startedAt = DateTimeOffset.Now;
+        var credentialsBySource = new Dictionary<string, ApiCredentials>(StringComparer.OrdinalIgnoreCase);
+        foreach (var source in Sources)
+        {
+            credentialsBySource[source.Code] = await ResolveCredentialsForSourceAsync(source);
+        }
+
+        return credentialsBySource;
+    }
+
+    private async Task<string> SynchronizeAllSourcesAsync(
+        IReadOnlyDictionary<string, ApiCredentials> credentialsBySource)
+    {
+        using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
+        var reloadStartedAt = DateTimeOffset.Now;
+        var sharedWindow = SyncWindowPolicy.Create(null, reloadStartedAt);
+        var batches = new List<CompleteSourceReload>();
+        foreach (var source in Sources)
+        {
+            batches.Add(await FetchCompleteSourceAsync(
+                source,
+                credentialsBySource[source.Code],
+                sharedWindow));
+        }
+
+        await _orderSnapshotStore.ReplaceAllAsync(
+            batches.SelectMany(batch => batch.Snapshots).ToArray());
+
+        foreach (var batch in batches)
+        {
+            try
+            {
+                await _syncStatusStore.RecordSuccessAsync(new SyncRunSummary(
+                    batch.Source.Code,
+                    batch.Source.Name,
+                    batch.Window.FromDate,
+                    batch.Window.ThroughDate,
+                    batch.StartedAt,
+                    batch.FinishedAt,
+                    batch.PageCount,
+                    batch.RowCount));
+            }
+            catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
+            {
+                ShowSyncStatusStorageError("完整訂單已載入，但本機同步摘要無法保存。", statusException);
+            }
+        }
+
+        var selected = SelectedSource;
+        await LoadSyncStatusAsync(selected.Code);
+        await LoadCommittedPreviewAsync(selected);
+        return "兩個網站完整訂單已一起更新；只保留目前仍在待處理頁面的訂單。";
+    }
+
+    private async Task<CompleteSourceReload> FetchCompleteSourceAsync(
+        WmsSource source,
+        ApiCredentials credentials,
+        SyncWindow window)
+    {
+        var startedAt = window.StartedAt;
         var lockDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "MidAutumnGiftBox",
             "locks");
         using var sourceLock = SourceSyncFileLock.TryAcquire(lockDirectory, source.Code)
             ?? throw new InvalidOperationException($"{source.Name} 同步進行中，請稍後再試。");
-        var previousStatus = await _syncStatusStore.GetAsync(source.Code);
-        var window = SyncWindowPolicy.Create(previousStatus?.LastSuccessAt, startedAt);
         try
         {
             var shops = await _wmsClient.GetShopsAsync(source, credentials);
@@ -338,78 +430,22 @@ internal sealed class MainForm : Form
                 throw new WmsApiException(result.Message);
             }
 
-                var finishedAt = DateTimeOffset.Now;
-                var allPreviousLines = await _orderSnapshotStore.GetAllAsync();
-                var previousLines = allPreviousLines
-                    .Where(line => line.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-                var currentLines = OrderSnapshotStore.BuildSourceSnapshot(
-                    source.Code, result.Rows, finishedAt);
-                var currentOrderNumbers = currentLines
-                    .Select(line => line.ExternalOrderNo)
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                var departedOrderNumbers = previousLines
-                    .Select(line => line.ExternalOrderNo)
-                    .Where(orderNo => !currentOrderNumbers.Contains(orderNo))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-                var departedStatuses = new Dictionary<string, OrderStatusResolution>(
-                    StringComparer.OrdinalIgnoreCase);
-                foreach (var orderNumber in departedOrderNumbers)
-                {
-                    var statusResult = await _wmsClient.GetOrderByNumberAsync(
-                        source, credentials, orderNumber);
-                    if (!statusResult.IsSuccess)
-                    {
-                        throw new WmsApiException(statusResult.Message);
-                    }
-
-                    var statusRow = statusResult.Rows.FirstOrDefault();
-                    departedStatuses[orderNumber] = new OrderStatusResolution(
-                        orderNumber,
-                        GetRowValue(statusRow, "status_code"),
-                        GetRowValue(statusRow, "status_name"));
-                }
-
-                var existingLedger = await _orderChangeLedgerStore.GetAllAsync();
-                var hasSourceLedger = existingLedger.Any(entry =>
-                    entry.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase));
-                var changeEntries = OrderChangePlanner.Plan(
-                    source.Name,
-                    hasSourceLedger ? previousLines : Array.Empty<OrderLineSnapshot>(),
-                    currentLines,
-                    departedStatuses,
-                    finishedAt);
-                await _orderChangeLedgerStore.AppendAsync(changeEntries);
-                await _orderSnapshotStore.ReplaceSourceAsync(
-                    source.Code,
-                    result.Rows,
-                    finishedAt);
-                try
-                {
-                    await _syncStatusStore.RecordSuccessAsync(new SyncRunSummary(
-                        source.Code,
-                        source.Name,
-                        window.FromDate,
-                        window.ThroughDate,
-                        startedAt,
-                        finishedAt,
-                        result.Metadata.PageCount,
-                        result.Metadata.RowCount));
-                    await LoadSyncStatusAsync(source.Code);
-                    await LoadCommittedPreviewAsync(source);
-                    return result.Message + $"；本機訂單快照已更新，追加 {changeEntries.Count} 筆異動紀錄。";
-                }
-                catch (Exception statusException) when (IsSyncStatusStorageError(statusException))
-                {
-                    ShowSyncStatusStorageError("訂單已載入，但本機同步摘要無法保存。", statusException);
-                    await LoadCommittedPreviewAsync(source);
-                    return result.Message + "（本機同步摘要未保存）";
-                }
+            var finishedAt = DateTimeOffset.Now;
+            var snapshots = OrderSnapshotStore.BuildSourceSnapshot(source.Code, result.Rows, finishedAt);
+            return new CompleteSourceReload(
+                source,
+                window,
+                startedAt,
+                finishedAt,
+                result.Metadata.PageCount,
+                result.Metadata.RowCount,
+                snapshots);
         }
         catch (Exception exception) when (exception is WmsApiException or ArgumentException or
-                                          InvalidOperationException or Win32Exception or IOException or
-                                          UnauthorizedAccessException or System.Text.Json.JsonException)
+                                          InvalidOperationException or InvalidDataException or
+                                          Win32Exception or IOException or
+                                          UnauthorizedAccessException or System.Text.Json.JsonException or
+                                          KeyNotFoundException)
         {
             try
             {
@@ -492,15 +528,9 @@ internal sealed class MainForm : Form
                 .ToArray();
             if (sourceLines.Length == 0)
             {
-                var hasChangeHistory = (await _orderChangeLedgerStore.GetAllAsync()).Any(entry =>
-                    entry.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase));
-                if (!hasChangeHistory)
-                {
-                    _grid.DataSource = null;
-                    _jsonBox.Clear();
-                    _previewMetadataLabel.Text = "此來源尚無已提交訂單快照。";
-                    return;
-                }
+                _grid.DataSource = null;
+                _previewMetadataLabel.Text = "此來源目前沒有待處理訂單。";
+                return;
             }
 
             SyncSourceStatus? status = null;
@@ -598,17 +628,121 @@ internal sealed class MainForm : Form
         }
 
         _grid.DataSource = BuildTable(result.Rows);
-        _jsonBox.Text = result.SafeJson;
+    }
+
+    private async Task LoadSpreadsheetAsync(SpreadsheetImportKind kind)
+    {
+        var title = kind switch
+        {
+            SpreadsheetImportKind.Erp => "選擇 ERP 產出數量 Excel",
+            SpreadsheetImportKind.Manual => "選擇手打單 Excel",
+            SpreadsheetImportKind.Pos => "選擇百貨 POS機預購報表 Excel",
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        };
+        var busyMessage = kind switch
+        {
+            SpreadsheetImportKind.Erp => "正在讀取 ERP Excel…",
+            SpreadsheetImportKind.Manual => "正在讀取手打單 Excel…",
+            SpreadsheetImportKind.Pos => "正在讀取 POS機 Excel…",
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        };
+        using var dialog = new OpenFileDialog
+        {
+            Title = title,
+            Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        await RunBusyAsync(busyMessage, async () =>
+        {
+            var importedAt = DateTimeOffset.Now;
+            var batch = kind == SpreadsheetImportKind.Pos
+                ? await PosSpreadsheetImportWorkflow.ImportAsync(
+                    dialog.FileName, importedAt, _posFirstImportStore)
+                : await Task.Run(() => kind switch
+                {
+                    SpreadsheetImportKind.Erp => SpreadsheetOrderImporter.ReadErp(dialog.FileName, importedAt),
+                    SpreadsheetImportKind.Manual => SpreadsheetOrderImporter.ReadManual(dialog.FileName, importedAt),
+                    _ => throw new ArgumentOutOfRangeException(nameof(kind))
+                });
+            if (kind == SpreadsheetImportKind.Erp)
+            {
+                _erpBatch = batch;
+                _erpGrid.DataSource = BuildImportTable(batch);
+            }
+            else if (kind == SpreadsheetImportKind.Manual)
+            {
+                _manualExcelBatch = batch;
+                _manualExcelGrid.DataSource = BuildImportTable(batch);
+            }
+            else
+            {
+                _posBatch = batch;
+                _posGrid.DataSource = BuildImportTable(batch);
+            }
+
+            return $"已讀取 {batch.FileName}：預覽 {batch.Rows.Count} 列、可匯出 {batch.ExportEntries.Count} 列" +
+                   (batch.ExcludedRowCount > 0 ? $"、排除非目標商品 {batch.ExcludedRowCount} 列。" : "。");
+        });
+    }
+
+    private static DataTable BuildImportTable(ImportedSpreadsheetBatch batch)
+    {
+        var table = new DataTable();
+        table.Columns.Add("資料列", typeof(int));
+        table.Columns.Add("通路別");
+        table.Columns.Add("訂單編號");
+        table.Columns.Add("料號");
+        table.Columns.Add("品項");
+        table.Columns.Add("地點");
+        table.Columns.Add("原定指定到貨日");
+        table.Columns.Add("下單日");
+        table.Columns.Add("數量", typeof(decimal));
+        table.Columns.Add("備註");
+        foreach (var row in batch.Rows)
+        {
+            table.Rows.Add(
+                row.SourceRowNumber,
+                row.ChannelName,
+                row.ExternalOrderNo,
+                row.Sku,
+                row.ProductName,
+                row.SourceLocation ?? string.Empty,
+                row.OriginalDeliveryDate ?? string.Empty,
+                row.OrderDate ?? string.Empty,
+                row.Quantity is null ? DBNull.Value : row.Quantity.Value,
+                row.Note ?? string.Empty);
+        }
+        return table;
     }
 
     private async Task ExportPreviewAsync()
     {
         IReadOnlyList<OrderChangeEntry> changeEntries;
         IReadOnlyList<OrderLineSnapshot> snapshots;
+        ManualOverrideState manualState;
         try
         {
-            changeEntries = await _orderChangeLedgerStore.GetAllAsync();
+            using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
             snapshots = await _orderSnapshotStore.GetAllAsync();
+            var wmsEntries = CurrentSnapshotOrderProjector.Project(
+                snapshots,
+                Sources.ToDictionary(
+                    source => source.Code,
+                    source => source.Name,
+                    StringComparer.OrdinalIgnoreCase),
+                DateTimeOffset.Now);
+            changeEntries = wmsEntries
+                .Concat(_erpBatch?.ExportEntries ?? [])
+                .Concat(_manualExcelBatch?.ExportEntries ?? [])
+                .Concat(_posBatch?.ExportEntries ?? [])
+                .ToArray();
+            manualState = await _manualOverrideStore.LoadAsync();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
                                           System.Text.Json.JsonException)
@@ -618,22 +752,47 @@ internal sealed class MainForm : Form
             return;
         }
 
+        ManualOverrideState? capturedState;
+        try
+        {
+            capturedState = await CaptureLastWorkbookChangesAsync(manualState);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                          InvalidOperationException or InvalidDataException or
+                                          System.Xml.XmlException or System.Text.Json.JsonException)
+        {
+            MessageBox.Show(this,
+                $"無法讀取上次正式 Excel 的人工修改：{exception.Message}\n\n請關閉 Excel 後重試，或把正確舊檔放回原路徑。",
+                "人工修改讀取失敗", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (capturedState is null)
+        {
+            return;
+        }
+        manualState = capturedState;
+
         if (changeEntries.Count == 0)
         {
-            MessageBox.Show(this, "請先同步兩個網站，再匯出 Excel。", "尚無可匯出資料",
+            MessageBox.Show(this, "請先同步兩個網站或載入來源 Excel，再匯出。", "尚無可匯出資料",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         using var dialog = new SaveFileDialog
         {
-            Title = "建立或追加三種中秋禮盒 Excel",
+            Title = "建立或更新中秋禮盒 Excel",
             Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
             DefaultExt = "xlsx",
             AddExtension = true,
             OverwritePrompt = true,
             FileName = "中秋禮盒訂單統計.xlsx"
         };
+        if (!string.IsNullOrWhiteSpace(manualState.LastWorkbookPath))
+        {
+            dialog.InitialDirectory = Path.GetDirectoryName(manualState.LastWorkbookPath);
+            dialog.FileName = Path.GetFileName(manualState.LastWorkbookPath);
+        }
 
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
@@ -642,11 +801,33 @@ internal sealed class MainForm : Form
 
         try
         {
-            GiftBoxWorkbookExporter.Export(dialog.FileName, changeEntries, snapshots);
+            var automaticEntries = GiftBoxWorkbookExporter.ResolveEntries(changeEntries, snapshots);
+            if (manualState.LastWorkbookPath is null && File.Exists(dialog.FileName))
+            {
+                manualState = CaptureFirstExistingWorkbook(
+                    dialog.FileName,
+                    automaticEntries,
+                    manualState);
+            }
+
+            var effectiveEntries = ManualOverrideWorkflow.Apply(automaticEntries, manualState.Overrides);
+            effectiveEntries = ManualOverrideWorkflow.ApplyAutomaticResets(
+                effectiveEntries,
+                manualState.PendingAutomaticResets ?? []);
+            GiftBoxWorkbookExporter.Export(dialog.FileName, effectiveEntries);
+            var exportedRows = GiftBoxWorkbookExporter.ReadEditableRows(dialog.FileName);
+            manualState = manualState with
+            {
+                LastWorkbookPath = Path.GetFullPath(dialog.FileName),
+                LastExportedRows = exportedRows,
+                PendingAutomaticResets = []
+            };
+            await _manualOverrideStore.SaveAsync(manualState);
             _statusLabel.Text = $"Excel 已匯出：{dialog.FileName}";
             MessageBox.Show(this,
-                "Excel 匯出完成。\n包含「三入」、「六入」、「九入」三張工作表，資料已合併兩個網站。\n" +
-                "數量以 Excel 數字保存；再次選取同一檔案時，只補新列並保留既有「確認」。",
+                "Excel 匯出完成。\n包含「訂單明細」、「日期待確認」、「統計」三張工作表。\n" +
+                "所有入數依來源、訂單編號、品名與指定到貨日逐筆列出；統計數量使用 Excel 原生公式。\n" +
+                "下次匯出前會讀回人工修改的指定到貨日、下單日、地點與確認，包含刻意留空的值。",
                 "匯出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
@@ -657,6 +838,191 @@ internal sealed class MainForm : Form
             MessageBox.Show(this, $"無法匯出 Excel：{exception.Message}", "匯出失敗",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    private async Task<ManualOverrideState?> CaptureLastWorkbookChangesAsync(ManualOverrideState state)
+    {
+        if (string.IsNullOrWhiteSpace(state.LastWorkbookPath))
+        {
+            return state;
+        }
+
+        var workbookPath = state.LastWorkbookPath;
+        if (!File.Exists(workbookPath))
+        {
+            var choice = MessageBox.Show(
+                this,
+                $"找不到上次正式 Excel：\n{workbookPath}\n\n" +
+                "若該檔曾有人工修改，請先把舊檔放回原路徑。\n" +
+                "按「是」可改選舊檔；按「否」確定匯出並沿用已保存的人工覆寫；按「取消」停止。",
+                "找不到上次正式 Excel",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button3);
+            if (choice == DialogResult.Cancel) return null;
+            if (choice == DialogResult.No) return state;
+
+            using var open = new OpenFileDialog
+            {
+                Title = "選擇先前正式匯出的 Excel",
+                Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+            if (open.ShowDialog(this) != DialogResult.OK) return null;
+            workbookPath = open.FileName;
+        }
+
+        var workbookRows = GiftBoxWorkbookExporter.ReadEditableRows(workbookPath);
+        var overrides = state.LastExportedRows.Count == 0
+            ? state.Overrides
+            : ManualOverrideWorkflow.CaptureChanges(
+                state.LastExportedRows,
+                workbookRows,
+                state.Overrides,
+                DateTimeOffset.Now);
+        var updated = state with
+        {
+            LastWorkbookPath = Path.GetFullPath(workbookPath),
+            Overrides = overrides
+        };
+        await _manualOverrideStore.SaveAsync(updated);
+        return updated;
+    }
+
+    private static ManualOverrideState CaptureFirstExistingWorkbook(
+        string workbookPath,
+        IReadOnlyList<OrderChangeEntry> automaticEntries,
+        ManualOverrideState state)
+    {
+        var temporaryPath = Path.Combine(
+            Path.GetTempPath(), $"mid-autumn-baseline-{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            GiftBoxWorkbookExporter.Export(temporaryPath, automaticEntries);
+            var baselineRows = GiftBoxWorkbookExporter.ReadEditableRows(temporaryPath);
+            var workbookRows = GiftBoxWorkbookExporter.ReadEditableRows(workbookPath);
+            return state with
+            {
+                Overrides = ManualOverrideWorkflow.CaptureChanges(
+                    baselineRows,
+                    workbookRows,
+                    state.Overrides,
+                    DateTimeOffset.Now)
+            };
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+        }
+    }
+
+    private async Task ClearManualOverrideAsync()
+    {
+        ManualOverrideState state;
+        try
+        {
+            state = await _manualOverrideStore.LoadAsync();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                          System.Text.Json.JsonException)
+        {
+            MessageBox.Show(this, $"無法讀取人工覆寫：{exception.Message}", "讀取失敗",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (state.Overrides.Count == 0)
+        {
+            MessageBox.Show(this, "目前沒有已保存的人工覆寫。", "清除人工覆寫",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var selected = SelectManualOverride(state);
+        if (selected is null) return;
+        var confirmation = MessageBox.Show(
+            this,
+            $"確定清除這筆訂單的四個人工欄位嗎？\n\n{selected.DisplayText}\n\n" +
+            "指定到貨日、下單日、地點、確認會在下次匯出時全部恢復為程式自動值。",
+            "確認清除人工覆寫",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirmation != DialogResult.Yes) return;
+
+        var baselineRows = state.LastExportedRows.ToList();
+        if (!string.IsNullOrWhiteSpace(state.LastWorkbookPath) && File.Exists(state.LastWorkbookPath))
+        {
+            var current = GiftBoxWorkbookExporter.ReadEditableRows(state.LastWorkbookPath)
+                .FirstOrDefault(row => row.RowKey.Equals(selected.Override.RowKey,
+                    StringComparison.OrdinalIgnoreCase));
+            if (current is not null)
+            {
+                baselineRows.RemoveAll(row => row.RowKey.Equals(selected.Override.RowKey,
+                    StringComparison.OrdinalIgnoreCase));
+                baselineRows.Add(current);
+            }
+        }
+
+        var pendingResets = (state.PendingAutomaticResets ?? [])
+            .Where(item => !item.RowKey.Equals(selected.Override.RowKey, StringComparison.OrdinalIgnoreCase))
+            .Append(new WorkbookRowAutomaticReset(
+                selected.Override.RowKey,
+                selected.Override.SourceLineFingerprints))
+            .ToArray();
+        await _manualOverrideStore.SaveAsync(state with
+        {
+            LastExportedRows = baselineRows,
+            Overrides = ManualOverrideWorkflow.Clear(state.Overrides, selected.Override.RowKey),
+            PendingAutomaticResets = pendingResets
+        });
+        MessageBox.Show(this, "已清除該筆訂單的四個人工覆寫；下次匯出會恢復自動值。",
+            "清除完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private ManualOverrideChoice? SelectManualOverride(ManualOverrideState state)
+    {
+        var rowsByKey = state.LastExportedRows
+            .GroupBy(row => row.RowKey, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var choices = state.Overrides.Select(item =>
+        {
+            rowsByKey.TryGetValue(item.RowKey, out var row);
+            var display = row is null
+                ? $"識別值 {item.RowKey[..Math.Min(12, item.RowKey.Length)]}"
+                : $"{row.ChannelName}｜{row.ExternalOrderNo}｜{row.ProductName}";
+            return new ManualOverrideChoice(item, display);
+        }).ToArray();
+
+        using var dialog = new Form
+        {
+            Text = "選擇要清除人工覆寫的訂單明細",
+            StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(720, 420),
+            MinimizeBox = false,
+            MaximizeBox = false
+        };
+        var list = new ListBox { Dock = DockStyle.Fill, DisplayMember = nameof(ManualOverrideChoice.DisplayText) };
+        list.DataSource = choices;
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            AutoSize = true,
+            FlowDirection = FlowDirection.RightToLeft,
+            Padding = new Padding(8)
+        };
+        var cancel = new Button { Text = "取消", AutoSize = true, DialogResult = DialogResult.Cancel };
+        var ok = new Button { Text = "選擇", AutoSize = true, DialogResult = DialogResult.OK };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(ok);
+        dialog.Controls.Add(list);
+        dialog.Controls.Add(buttons);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        return dialog.ShowDialog(this) == DialogResult.OK
+            ? list.SelectedItem as ManualOverrideChoice
+            : null;
     }
 
     private static DataTable BuildTable(IReadOnlyList<IReadOnlyDictionary<string, string?>> rows)
@@ -725,10 +1091,34 @@ internal sealed class MainForm : Form
         _shopsButton.Enabled = !busy;
         _ordersButton.Enabled = !busy && _sourceBox.SelectedItem is WmsSource;
         _exportButton.Enabled = !busy;
+        _clearOverridesButton.Enabled = !busy;
+        _loadErpFileButton.Enabled = !busy;
+        _loadManualExcelButton.Enabled = !busy;
+        _loadPosFileButton.Enabled = !busy;
         _progress.Visible = busy;
         Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         _statusLabel.Text = message;
     }
+
+    private enum SpreadsheetImportKind
+    {
+        Erp,
+        Manual,
+        Pos
+    }
+
+    private sealed record CompleteSourceReload(
+        WmsSource Source,
+        SyncWindow Window,
+        DateTimeOffset StartedAt,
+        DateTimeOffset FinishedAt,
+        int PageCount,
+        int RowCount,
+        IReadOnlyList<OrderLineSnapshot> Snapshots);
+
+    private sealed record ManualOverrideChoice(
+        OrderRowManualOverride Override,
+        string DisplayText);
 
     private void UpdateOrderButtonState()
     {

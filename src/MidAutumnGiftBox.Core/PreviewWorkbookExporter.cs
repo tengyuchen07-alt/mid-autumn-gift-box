@@ -11,10 +11,12 @@ public static class PreviewWorkbookExporter
 {
     private static readonly string[] PreferredOrderColumns =
     [
-        "order_no", "order_date", "source", "shop_name", "source_key", "arrival_date",
+        "order_no", "order_date", "source", "shop_name", "source_key", "note", "arrival_date",
         "ship_window_start", "ship_window_end", "derived_shipping_date", "shipping_date_source",
         "status_code", "status_name", "total_price"
     ];
+    private static readonly IReadOnlySet<string> PreferredOrderColumnSet =
+        new HashSet<string>(PreferredOrderColumns, StringComparer.OrdinalIgnoreCase);
 
     private static readonly string[] ProductColumns =
     [
@@ -93,10 +95,11 @@ public static class PreviewWorkbookExporter
             .Where(key => !key.Equals("products", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var discoveredSet = new HashSet<string>(discovered, StringComparer.OrdinalIgnoreCase);
         var headers = PreferredOrderColumns.Where(preferred =>
-                discovered.Contains(preferred, StringComparer.OrdinalIgnoreCase))
+                discoveredSet.Contains(preferred))
             .Concat(discovered.Where(column =>
-                !PreferredOrderColumns.Contains(column, StringComparer.OrdinalIgnoreCase)))
+                !PreferredOrderColumnSet.Contains(column)))
             .Append("商品摘要")
             .ToArray();
 
