@@ -86,14 +86,18 @@ internal sealed class MainForm : Form
     private readonly LocalHistoryResetService _historyResetService;
     private readonly WmsApiClient _wmsClient;
     private readonly StartupSpreadsheetInputs? _startupInputs;
+    private readonly bool _runQuickWorkflow;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
     private ImportedSpreadsheetBatch? _erpBatch;
     private ImportedSpreadsheetBatch? _manualExcelBatch;
     private ImportedSpreadsheetBatch? _posBatch;
 
-    public MainForm(StartupSpreadsheetInputs? startupInputs = null)
+    public MainForm(
+        StartupSpreadsheetInputs? startupInputs = null,
+        bool runQuickWorkflow = false)
     {
         _startupInputs = startupInputs;
+        _runQuickWorkflow = runQuickWorkflow;
         var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("MidAutumnGiftBox/1.0");
         _wmsClient = new WmsApiClient(httpClient);
@@ -140,8 +144,29 @@ internal sealed class MainForm : Form
                 await LoadCredentialStatusAsync();
                 if (_startupInputs is not null)
                 {
-                    await LoadStartupSpreadsheetsAsync(_startupInputs);
+                    if (_runQuickWorkflow)
+                    {
+                        await RunQuickWorkflowAsync(_startupInputs);
+                    }
+                    else
+                    {
+                        await LoadStartupSpreadsheetsAsync(_startupInputs);
+                    }
                 }
+            }
+            catch (Exception exception) when (IsExpectedOperationException(exception))
+            {
+                _statusLabel.Text = _runQuickWorkflow
+                    ? "快速流程失敗，未匯出新版 Excel。"
+                    : "程式狀態載入失敗。";
+                MessageBox.Show(
+                    this,
+                    _runQuickWorkflow
+                        ? $"快速流程已停止：\n{exception.Message}\n\n未匯出新版「{StartupSpreadsheetInputs.OutputFileName}」。"
+                        : $"無法載入程式狀態：{exception.Message}",
+                    _runQuickWorkflow ? "快速流程失敗" : "載入失敗",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
             }
             finally
             {
@@ -729,6 +754,148 @@ internal sealed class MainForm : Form
         }
     }
 
+    private async Task RunQuickWorkflowAsync(StartupSpreadsheetInputs inputs)
+    {
+        try
+        {
+            if (!inputs.HasAllRequiredInputs)
+            {
+                throw new InvalidOperationException(
+                    "快速流程缺少必要檔案：\n" +
+                    string.Join("\n", inputs.MissingFileNames.Select(fileName => $"• {fileName}")));
+            }
+
+            var importSummaries = new List<string>();
+            foreach (var (kind, path) in new[]
+                     {
+                         (SpreadsheetImportKind.Erp, inputs.ErpPath!),
+                         (SpreadsheetImportKind.Manual, inputs.ManualPath!),
+                         (SpreadsheetImportKind.Pos, inputs.PosPath!)
+                     })
+            {
+                _statusLabel.Text = BusyMessage(kind);
+                var batch = await ImportSpreadsheetPathAsync(kind, path);
+                importSummaries.Add(ImportSummary(batch));
+            }
+
+            _statusLabel.Text = "正在取得兩個網站的完整訂單…";
+            var credentialsBySource = await ResolveAllCredentialsAsync();
+            var synchronizationSummary = await SynchronizeAllSourcesAsync(credentialsBySource);
+
+            _statusLabel.Text = "正在匯出固定中秋禮盒 Excel…";
+            await ExportQuickPreviewAsync(inputs.OutputPath);
+            _statusLabel.Text = $"快速流程完成：{inputs.OutputPath}";
+
+            MessageBox.Show(
+                this,
+                "快速流程已完成。\n\n" +
+                string.Join("\n", importSummaries.Select(summary => $"• {summary}")) +
+                $"\n\n• {synchronizationSummary}\n• 已匯出：{inputs.OutputPath}\n\n" +
+                "既有人工修改已保留；快速流程不會清除人工覆寫。",
+                "快速流程完成",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception exception) when (IsExpectedOperationException(exception))
+        {
+            _statusLabel.Text = "快速流程失敗，未匯出新版 Excel。";
+            MessageBox.Show(
+                this,
+                $"快速流程已停止：\n{exception.Message}\n\n未匯出新版「{StartupSpreadsheetInputs.OutputFileName}」。",
+                "快速流程失敗",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private async Task ExportQuickPreviewAsync(string path)
+    {
+        using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
+        var snapshots = await _orderSnapshotStore.GetAllAsync();
+        var wmsEntries = CurrentSnapshotOrderProjector.Project(
+            snapshots,
+            Sources.ToDictionary(
+                source => source.Code,
+                source => source.Name,
+                StringComparer.OrdinalIgnoreCase),
+            DateTimeOffset.Now);
+        var changeEntries = wmsEntries
+            .Concat(_erpBatch?.ExportEntries ?? [])
+            .Concat(_manualExcelBatch?.ExportEntries ?? [])
+            .Concat(_posBatch?.ExportEntries ?? [])
+            .ToArray();
+        if (changeEntries.Length == 0)
+        {
+            throw new InvalidOperationException("兩站及固定 Excel 都沒有可匯出的訂單資料。");
+        }
+
+        var manualState = await _manualOverrideStore.LoadAsync();
+        manualState = await CaptureLastWorkbookChangesAsync(manualState, promptWhenMissing: false)
+                      ?? manualState;
+        var automaticEntries = GiftBoxWorkbookExporter.ResolveEntries(changeEntries, snapshots);
+        var fullPath = Path.GetFullPath(path);
+        if (manualState.LastWorkbookPath is null && File.Exists(fullPath))
+        {
+            manualState = CaptureFirstExistingWorkbook(fullPath, automaticEntries, manualState);
+        }
+
+        var effectiveEntries = ManualOverrideWorkflow.Apply(automaticEntries, manualState.Overrides);
+        effectiveEntries = ManualOverrideWorkflow.ApplyAutomaticResets(
+            effectiveEntries,
+            manualState.PendingAutomaticResets ?? []);
+        var preparedPath = PrepareWorkbook(fullPath, effectiveEntries);
+        try
+        {
+            var exportedRows = GiftBoxWorkbookExporter.ReadEditableRows(preparedPath);
+            await _manualOverrideStore.SaveAsync(manualState with
+            {
+                LastWorkbookPath = fullPath,
+                LastExportedRows = exportedRows,
+                PendingAutomaticResets = []
+            });
+            try
+            {
+                File.Move(preparedPath, fullPath, overwrite: true);
+            }
+            catch
+            {
+                await _manualOverrideStore.SaveAsync(manualState);
+                throw;
+            }
+        }
+        finally
+        {
+            if (File.Exists(preparedPath)) File.Delete(preparedPath);
+        }
+    }
+
+    private static string PrepareWorkbook(
+        string fullPath,
+        IReadOnlyList<OrderChangeEntry> entries)
+    {
+        var directory = Path.GetDirectoryName(fullPath)
+                        ?? throw new InvalidOperationException("固定匯出路徑缺少資料夾。");
+        Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(
+            directory,
+            $".{Path.GetFileNameWithoutExtension(fullPath)}.{Guid.NewGuid():N}.tmp.xlsx");
+        try
+        {
+            if (File.Exists(fullPath))
+            {
+                File.Copy(fullPath, temporaryPath, overwrite: false);
+            }
+
+            GiftBoxWorkbookExporter.Export(temporaryPath, entries);
+            return temporaryPath;
+        }
+        catch
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            throw;
+        }
+    }
+
     private async Task<ImportedSpreadsheetBatch> ImportSpreadsheetPathAsync(
         SpreadsheetImportKind kind,
         string path)
@@ -778,7 +945,8 @@ internal sealed class MainForm : Form
 
     private static bool IsExpectedOperationException(Exception exception) =>
         exception is WmsApiException or ArgumentException or InvalidOperationException or Win32Exception or
-            IOException or UnauthorizedAccessException or System.Text.Json.JsonException;
+            InvalidDataException or IOException or UnauthorizedAccessException or System.Text.Json.JsonException or
+            System.Xml.XmlException or KeyNotFoundException;
 
     private static DataTable BuildImportTable(ImportedSpreadsheetBatch batch)
     {
@@ -929,7 +1097,9 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task<ManualOverrideState?> CaptureLastWorkbookChangesAsync(ManualOverrideState state)
+    private async Task<ManualOverrideState?> CaptureLastWorkbookChangesAsync(
+        ManualOverrideState state,
+        bool promptWhenMissing = true)
     {
         if (string.IsNullOrWhiteSpace(state.LastWorkbookPath))
         {
@@ -939,6 +1109,11 @@ internal sealed class MainForm : Form
         var workbookPath = state.LastWorkbookPath;
         if (!File.Exists(workbookPath))
         {
+            if (!promptWhenMissing)
+            {
+                return state;
+            }
+
             var choice = MessageBox.Show(
                 this,
                 $"找不到上次正式 Excel：\n{workbookPath}\n\n" +

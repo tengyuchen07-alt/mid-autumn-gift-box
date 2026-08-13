@@ -122,8 +122,15 @@ static Task StartupSpreadsheetInputsResolveFixedFileNames()
         Equal(Path.GetFullPath(erpPath), inputs.ErpPath, "ERP fixed input path is incorrect.");
         Equal(null, inputs.ManualPath, "A missing manual workbook must remain absent.");
         Equal(Path.GetFullPath(posPath), inputs.PosPath, "POS fixed input path is incorrect.");
+        Equal(Path.Combine(Path.GetFullPath(directory), "中秋禮盒訂單統計.xlsx"), inputs.OutputPath,
+            "Quick workflow output path is incorrect.");
+        True(!inputs.HasAllRequiredInputs, "A missing fixed workbook must make the quick workflow incomplete.");
         True(inputs.MissingFileNames.SequenceEqual(["蛋黃酥-數量.xlsx"]),
             "Missing fixed input names are incorrect.");
+
+        File.WriteAllBytes(Path.Combine(directory, "蛋黃酥-數量.xlsx"), []);
+        True(StartupSpreadsheetInputs.Resolve(directory).HasAllRequiredInputs,
+            "All three fixed workbooks must make the quick workflow complete.");
         return Task.CompletedTask;
     }
     finally

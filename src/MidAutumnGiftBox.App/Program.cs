@@ -8,10 +8,14 @@ internal static class Program
     private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        var startupInputs = args.Length == 2 &&
-                            args[0].Equals("--auto-import", StringComparison.OrdinalIgnoreCase)
+        var hasStartupDirectory = args.Length == 2 &&
+                                  (args[0].Equals("--auto-import", StringComparison.OrdinalIgnoreCase) ||
+                                   args[0].Equals("--quick-run", StringComparison.OrdinalIgnoreCase));
+        var startupInputs = hasStartupDirectory
             ? StartupSpreadsheetInputs.Resolve(args[1])
             : null;
-        Application.Run(new MainForm(startupInputs));
+        var runQuickWorkflow = hasStartupDirectory &&
+                               args[0].Equals("--quick-run", StringComparison.OrdinalIgnoreCase);
+        Application.Run(new MainForm(startupInputs, runQuickWorkflow));
     }
 }

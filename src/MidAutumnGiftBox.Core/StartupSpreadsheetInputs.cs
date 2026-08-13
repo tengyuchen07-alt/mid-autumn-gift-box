@@ -10,6 +10,10 @@ public sealed record StartupSpreadsheetInputs(
     public const string ErpFileName = "ERP產出數量.xlsx";
     public const string ManualFileName = "蛋黃酥-數量.xlsx";
     public const string PosFileName = "百貨專櫃門市預購報表.xlsx";
+    public const string OutputFileName = "中秋禮盒訂單統計.xlsx";
+
+    public string OutputPath => Path.Combine(RootDirectory, OutputFileName);
+    public bool HasAllRequiredInputs => MissingFileNames.Count == 0;
 
     public static StartupSpreadsheetInputs Resolve(string rootDirectory)
     {
