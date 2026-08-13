@@ -75,6 +75,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Excel 三張工作表使用標楷體且不建立自動篩選", WorkbookUsesDfkaiAndHasNoAutoFilters),
     ("更新舊版 Excel 會補標楷體並移除既有篩選", LegacyWorkbookUpdateAddsDfkaiAndRemovesFilters),
     ("ERP 與手打單 Excel 依欄名載入並產生可匯出資料", SpreadsheetSourcesMapColumnsAndTargetSkus),
+    ("自動載入會從啟動資料夾解析三個固定 Excel 檔名", StartupSpreadsheetInputsResolveFixedFileNames),
     ("百貨 POS 預購報表依完整通路與非空白貨號安全匯入", PosSpreadsheetMapsExactChannelsDatesProductsAndQuantities),
     ("POS 無預購日固定首次載入排程且跨日重載不漂移", PosMissingPickupDateUsesPersistentFirstImportSchedule),
     ("手打單兩種單入品名進入日期待確認且不互相合併", ManualSingleItemsUseSeparateWorksheet),
@@ -104,6 +105,32 @@ foreach (var test in tests)
 
 Console.WriteLine($"Tests: {tests.Length}, Passed: {tests.Length - failed}, Failed: {failed}");
 return failed == 0 ? 0 : 1;
+
+static Task StartupSpreadsheetInputsResolveFixedFileNames()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-startup-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var erpPath = Path.Combine(directory, "ERP產出數量.xlsx");
+        var posPath = Path.Combine(directory, "百貨專櫃門市預購報表.xlsx");
+        File.WriteAllBytes(erpPath, []);
+        File.WriteAllBytes(posPath, []);
+
+        var inputs = StartupSpreadsheetInputs.Resolve(directory);
+
+        Equal(Path.GetFullPath(erpPath), inputs.ErpPath, "ERP fixed input path is incorrect.");
+        Equal(null, inputs.ManualPath, "A missing manual workbook must remain absent.");
+        Equal(Path.GetFullPath(posPath), inputs.PosPath, "POS fixed input path is incorrect.");
+        True(inputs.MissingFileNames.SequenceEqual(["蛋黃酥-數量.xlsx"]),
+            "Missing fixed input names are incorrect.");
+        return Task.CompletedTask;
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
 
 static async Task ShopPreviewUsesBearerAndRemovesSensitiveData()
 {

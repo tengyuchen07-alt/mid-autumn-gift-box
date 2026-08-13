@@ -85,13 +85,15 @@ internal sealed class MainForm : Form
     private readonly PosFirstImportStore _posFirstImportStore;
     private readonly LocalHistoryResetService _historyResetService;
     private readonly WmsApiClient _wmsClient;
+    private readonly StartupSpreadsheetInputs? _startupInputs;
     private readonly HashSet<string> _shopValidatedSources = new(StringComparer.OrdinalIgnoreCase);
     private ImportedSpreadsheetBatch? _erpBatch;
     private ImportedSpreadsheetBatch? _manualExcelBatch;
     private ImportedSpreadsheetBatch? _posBatch;
 
-    public MainForm()
+    public MainForm(StartupSpreadsheetInputs? startupInputs = null)
     {
+        _startupInputs = startupInputs;
         var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("MidAutumnGiftBox/1.0");
         _wmsClient = new WmsApiClient(httpClient);
@@ -132,7 +134,19 @@ internal sealed class MainForm : Form
 
         Shown += async (_, _) =>
         {
-            await LoadCredentialStatusAsync();
+            SetBusy(true, _startupInputs is null ? "正在載入程式狀態…" : "正在準備自動載入固定 Excel…");
+            try
+            {
+                await LoadCredentialStatusAsync();
+                if (_startupInputs is not null)
+                {
+                    await LoadStartupSpreadsheetsAsync(_startupInputs);
+                }
+            }
+            finally
+            {
+                SetBusy(false, _statusLabel.Text ?? "準備就緒");
+            }
         };
     }
 
@@ -639,13 +653,6 @@ internal sealed class MainForm : Form
             SpreadsheetImportKind.Pos => "選擇百貨 POS機預購報表 Excel",
             _ => throw new ArgumentOutOfRangeException(nameof(kind))
         };
-        var busyMessage = kind switch
-        {
-            SpreadsheetImportKind.Erp => "正在讀取 ERP Excel…",
-            SpreadsheetImportKind.Manual => "正在讀取手打單 Excel…",
-            SpreadsheetImportKind.Pos => "正在讀取 POS機 Excel…",
-            _ => throw new ArgumentOutOfRangeException(nameof(kind))
-        };
         using var dialog = new OpenFileDialog
         {
             Title = title,
@@ -658,38 +665,120 @@ internal sealed class MainForm : Form
             return;
         }
 
-        await RunBusyAsync(busyMessage, async () =>
+        await RunBusyAsync(BusyMessage(kind), async () =>
         {
-            var importedAt = DateTimeOffset.Now;
-            var batch = kind == SpreadsheetImportKind.Pos
-                ? await PosSpreadsheetImportWorkflow.ImportAsync(
-                    dialog.FileName, importedAt, _posFirstImportStore)
-                : await Task.Run(() => kind switch
-                {
-                    SpreadsheetImportKind.Erp => SpreadsheetOrderImporter.ReadErp(dialog.FileName, importedAt),
-                    SpreadsheetImportKind.Manual => SpreadsheetOrderImporter.ReadManual(dialog.FileName, importedAt),
-                    _ => throw new ArgumentOutOfRangeException(nameof(kind))
-                });
-            if (kind == SpreadsheetImportKind.Erp)
-            {
-                _erpBatch = batch;
-                _erpGrid.DataSource = BuildImportTable(batch);
-            }
-            else if (kind == SpreadsheetImportKind.Manual)
-            {
-                _manualExcelBatch = batch;
-                _manualExcelGrid.DataSource = BuildImportTable(batch);
-            }
-            else
-            {
-                _posBatch = batch;
-                _posGrid.DataSource = BuildImportTable(batch);
-            }
-
-            return $"已讀取 {batch.FileName}：預覽 {batch.Rows.Count} 列、可匯出 {batch.ExportEntries.Count} 列" +
-                   (batch.ExcludedRowCount > 0 ? $"、排除非目標商品 {batch.ExcludedRowCount} 列。" : "。");
+            var batch = await ImportSpreadsheetPathAsync(kind, dialog.FileName);
+            return ImportSummary(batch);
         });
     }
+
+    private async Task LoadStartupSpreadsheetsAsync(StartupSpreadsheetInputs inputs)
+    {
+        var successes = new List<string>();
+        var failures = new List<string>();
+        SetBusy(true, "正在自動載入固定 Excel…");
+        try
+        {
+            foreach (var (kind, path) in new[]
+                     {
+                         (SpreadsheetImportKind.Erp, inputs.ErpPath),
+                         (SpreadsheetImportKind.Manual, inputs.ManualPath),
+                         (SpreadsheetImportKind.Pos, inputs.PosPath)
+                     })
+            {
+                if (path is null) continue;
+                try
+                {
+                    _statusLabel.Text = BusyMessage(kind);
+                    var batch = await ImportSpreadsheetPathAsync(kind, path);
+                    successes.Add(ImportSummary(batch));
+                }
+                catch (Exception exception) when (IsExpectedOperationException(exception))
+                {
+                    failures.Add($"{Path.GetFileName(path)}：{exception.Message}");
+                }
+            }
+
+            var summary = new List<string>();
+            if (successes.Count > 0)
+            {
+                summary.Add("自動載入成功：\n" + string.Join("\n", successes.Select(value => $"• {value}")));
+            }
+            if (inputs.MissingFileNames.Count > 0)
+            {
+                summary.Add("找不到檔案：\n" + string.Join("\n", inputs.MissingFileNames.Select(value => $"• {value}")));
+            }
+            if (failures.Count > 0)
+            {
+                summary.Add("載入失敗：\n" + string.Join("\n", failures.Select(value => $"• {value}")));
+            }
+
+            _statusLabel.Text = failures.Count == 0 && inputs.MissingFileNames.Count == 0
+                ? "固定 Excel 已全部自動載入。"
+                : "固定 Excel 自動載入完成，部分檔案需要處理。";
+            MessageBox.Show(
+                this,
+                string.Join("\n\n", summary),
+                "固定 Excel 自動載入結果",
+                MessageBoxButtons.OK,
+                failures.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            SetBusy(false, _statusLabel.Text ?? "準備就緒");
+        }
+    }
+
+    private async Task<ImportedSpreadsheetBatch> ImportSpreadsheetPathAsync(
+        SpreadsheetImportKind kind,
+        string path)
+    {
+        var importedAt = DateTimeOffset.Now;
+        var batch = kind == SpreadsheetImportKind.Pos
+            ? await PosSpreadsheetImportWorkflow.ImportAsync(path, importedAt, _posFirstImportStore)
+            : await Task.Run(() => kind switch
+            {
+                SpreadsheetImportKind.Erp => SpreadsheetOrderImporter.ReadErp(path, importedAt),
+                SpreadsheetImportKind.Manual => SpreadsheetOrderImporter.ReadManual(path, importedAt),
+                _ => throw new ArgumentOutOfRangeException(nameof(kind))
+            });
+
+        switch (kind)
+        {
+            case SpreadsheetImportKind.Erp:
+                _erpBatch = batch;
+                _erpGrid.DataSource = BuildImportTable(batch);
+                break;
+            case SpreadsheetImportKind.Manual:
+                _manualExcelBatch = batch;
+                _manualExcelGrid.DataSource = BuildImportTable(batch);
+                break;
+            case SpreadsheetImportKind.Pos:
+                _posBatch = batch;
+                _posGrid.DataSource = BuildImportTable(batch);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind));
+        }
+
+        return batch;
+    }
+
+    private static string BusyMessage(SpreadsheetImportKind kind) => kind switch
+    {
+        SpreadsheetImportKind.Erp => "正在讀取 ERP Excel…",
+        SpreadsheetImportKind.Manual => "正在讀取手打單 Excel…",
+        SpreadsheetImportKind.Pos => "正在讀取 POS機 Excel…",
+        _ => throw new ArgumentOutOfRangeException(nameof(kind))
+    };
+
+    private static string ImportSummary(ImportedSpreadsheetBatch batch) =>
+        $"已讀取 {batch.FileName}：預覽 {batch.Rows.Count} 列、可匯出 {batch.ExportEntries.Count} 列" +
+        (batch.ExcludedRowCount > 0 ? $"、排除非目標商品 {batch.ExcludedRowCount} 列。" : "。");
+
+    private static bool IsExpectedOperationException(Exception exception) =>
+        exception is WmsApiException or ArgumentException or InvalidOperationException or Win32Exception or
+            IOException or UnauthorizedAccessException or System.Text.Json.JsonException;
 
     private static DataTable BuildImportTable(ImportedSpreadsheetBatch batch)
     {

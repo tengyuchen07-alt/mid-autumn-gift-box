@@ -4,6 +4,7 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $testProject = Join-Path $projectRoot 'tests\MidAutumnGiftBox.Core.Tests\MidAutumnGiftBox.Core.Tests.csproj'
 $appProject = Join-Path $projectRoot 'src\MidAutumnGiftBox.App\MidAutumnGiftBox.App.csproj'
 $publishDirectory = Join-Path $projectRoot 'build\publish'
+$autoImportScript = Join-Path $projectRoot 'auto-import.cmd'
 
 dotnet restore $testProject --nologo
 if ($LASTEXITCODE -ne 0) { throw "Test project restore failed with exit code $LASTEXITCODE." }
@@ -19,5 +20,13 @@ dotnet publish $appProject --configuration Release --runtime win-x64 --self-cont
     -p:IncludeNativeLibrariesForSelfExtract=true `
     --output $publishDirectory
 if ($LASTEXITCODE -ne 0) { throw "App publish failed with exit code $LASTEXITCODE." }
+
+$publishedExecutable = Get-ChildItem -LiteralPath $publishDirectory -Filter '*.exe' |
+    Where-Object { $_.Name -ne 'MidAutumnGiftBox.exe' } |
+    Select-Object -First 1
+if ($null -eq $publishedExecutable) { throw 'Published app executable was not found.' }
+Copy-Item -LiteralPath $publishedExecutable.FullName `
+    -Destination (Join-Path $publishDirectory 'MidAutumnGiftBox.exe') -Force
+Copy-Item -LiteralPath $autoImportScript -Destination $publishDirectory -Force
 
 Write-Host "Published to $publishDirectory"
