@@ -29,6 +29,7 @@ public sealed class LocalHistoryResetService
     [
         "sync-status.json",
         "order-snapshot.json",
+        "order-snapshot.staged.json",
         "order-change-ledger.json"
     ];
 

@@ -37,6 +37,16 @@ public sealed record WorkbookRowAutomaticReset(
 
 public static class ManualOverrideWorkflow
 {
+    public static ManualOverrideState ContinueWithNewWorkbook(ManualOverrideState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return state with
+        {
+            LastWorkbookPath = null,
+            LastExportedRows = []
+        };
+    }
+
     public static string BuildRowKey(IReadOnlyList<string> sourceLineFingerprints)
     {
         ArgumentNullException.ThrowIfNull(sourceLineFingerprints);

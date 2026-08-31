@@ -56,6 +56,64 @@ public static class ShippingLeadTimePolicy
         string? arrivalDate,
         string? shippingDateStatus)
     {
+        var sourceDate = ResolveSourceDeliveryDate(
+            shipWindowStart,
+            shipWindowEnd,
+            arrivalDate,
+            shippingDateStatus);
+        return sourceDate is not null
+            ? AdjustDeliveryDate(sourceDate.Value).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+            : null;
+    }
+
+    public static string? ResolveOneDayEarlier(
+        string? shipWindowStart,
+        string? shipWindowEnd,
+        string? arrivalDate,
+        string? shippingDateStatus)
+    {
+        var deliveryDate = ResolveOneDayEarlierDeliveryDate(
+            shipWindowStart,
+            shipWindowEnd,
+            arrivalDate,
+            shippingDateStatus);
+        return deliveryDate?.AddDays(-7).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+    }
+
+    public static string? ResolveOriginalOneDayEarlier(
+        string? shipWindowStart,
+        string? shipWindowEnd,
+        string? arrivalDate,
+        string? shippingDateStatus) =>
+        ResolveOneDayEarlierDeliveryDate(
+                shipWindowStart,
+                shipWindowEnd,
+                arrivalDate,
+                shippingDateStatus)
+            ?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    private static DateOnly? ResolveOneDayEarlierDeliveryDate(
+        string? shipWindowStart,
+        string? shipWindowEnd,
+        string? arrivalDate,
+        string? shippingDateStatus)
+    {
+        var sourceDate = ResolveSourceDeliveryDate(
+            shipWindowStart,
+            shipWindowEnd,
+            arrivalDate,
+            shippingDateStatus);
+        return sourceDate is not null
+            ? AdjustDeliveryDate(sourceDate.Value.AddDays(-1))
+            : null;
+    }
+
+    private static DateOnly? ResolveSourceDeliveryDate(
+        string? shipWindowStart,
+        string? shipWindowEnd,
+        string? arrivalDate,
+        string? shippingDateStatus)
+    {
         var status = shippingDateStatus?.Trim();
         if (status is not null &&
             (status.Equals("conflict", StringComparison.OrdinalIgnoreCase) ||
@@ -82,14 +140,10 @@ public static class ShippingLeadTimePolicy
                 }
             }
 
-            return candidate <= end
-                ? AdjustDeliveryDate(candidate).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-                : null;
+            return candidate <= end ? candidate : null;
         }
 
-        return TryParseDate(arrivalDate, out var arrival)
-            ? AdjustDeliveryDate(arrival).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-            : null;
+        return TryParseDate(arrivalDate, out var arrival) ? arrival : null;
     }
 
     private static bool TryParseDate(string? value, out DateOnly date) =>

@@ -58,6 +58,7 @@ internal sealed class MainForm : Form
     private readonly Button _shopsButton = new() { Text = "取得店舖清單", AutoSize = true };
     private readonly Button _ordersButton = new() { Text = "重新載入完整訂單", AutoSize = true };
     private readonly Button _exportButton = new() { Text = "匯出／更新禮盒 Excel", AutoSize = true };
+    private readonly Button _testExportButton = new() { Text = "測試匯出（不保存）", AutoSize = true };
     private readonly Button _clearOverridesButton = new() { Text = "清除人工覆寫", AutoSize = true };
     private readonly Button _loadErpFileButton = new() { Text = "選擇 ERP Excel", AutoSize = true };
     private readonly Button _loadManualExcelButton = new() { Text = "選擇手打單 Excel", AutoSize = true };
@@ -81,6 +82,7 @@ internal sealed class MainForm : Form
     private readonly CredentialManager _credentialManager = new(new WindowsCredentialVault());
     private readonly SyncStatusStore _syncStatusStore;
     private readonly OrderSnapshotStore _orderSnapshotStore;
+    private readonly StagedOrderSnapshotStore _stagedOrderSnapshotStore;
     private readonly ManualOverrideStore _manualOverrideStore;
     private readonly PosFirstImportStore _posFirstImportStore;
     private readonly LocalHistoryResetService _historyResetService;
@@ -106,6 +108,8 @@ internal sealed class MainForm : Form
             "MidAutumnGiftBox");
         _syncStatusStore = new SyncStatusStore(Path.Combine(dataDirectory, "sync-status.json"));
         _orderSnapshotStore = new OrderSnapshotStore(Path.Combine(dataDirectory, "order-snapshot.json"));
+        _stagedOrderSnapshotStore = new StagedOrderSnapshotStore(
+            Path.Combine(dataDirectory, "order-snapshot.staged.json"));
         _manualOverrideStore = new ManualOverrideStore(Path.Combine(dataDirectory, "manual-overrides.json"));
         _posFirstImportStore = new PosFirstImportStore(Path.Combine(dataDirectory, "pos-first-import.json"));
         _historyResetService = new LocalHistoryResetService(
@@ -129,6 +133,7 @@ internal sealed class MainForm : Form
         _shopsButton.Click += async (_, _) => await LoadShopsAsync();
         _ordersButton.Click += async (_, _) => await LoadAllOrdersAsync();
         _exportButton.Click += async (_, _) => await ExportPreviewAsync();
+        _testExportButton.Click += async (_, _) => await ExportTestPreviewAsync();
         _clearOverridesButton.Click += async (_, _) => await ClearManualOverrideAsync();
         _loadErpFileButton.Click += async (_, _) => await LoadSpreadsheetAsync(SpreadsheetImportKind.Erp);
         _loadManualExcelButton.Click += async (_, _) => await LoadSpreadsheetAsync(SpreadsheetImportKind.Manual);
@@ -141,6 +146,7 @@ internal sealed class MainForm : Form
             SetBusy(true, _startupInputs is null ? "正在載入程式狀態…" : "正在準備自動載入固定 Excel…");
             try
             {
+                await RecoverStagedExportAsync();
                 await LoadCredentialStatusAsync();
                 if (_startupInputs is not null)
                 {
@@ -244,6 +250,7 @@ internal sealed class MainForm : Form
         actionPanel.Controls.Add(_orderRangeLabel);
         actionPanel.Controls.Add(_ordersButton);
         actionPanel.Controls.Add(_exportButton);
+        actionPanel.Controls.Add(_testExportButton);
         actionPanel.Controls.Add(_clearOverridesButton);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
@@ -323,6 +330,142 @@ internal sealed class MainForm : Form
     private WmsSource SelectedSource => _sourceBox.SelectedItem as WmsSource
         ?? throw new InvalidOperationException("請選擇資料來源。");
 
+    private async Task RecoverStagedExportAsync()
+    {
+        using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
+        var staged = await _stagedOrderSnapshotStore.GetAsync();
+        if (staged is null || staged.State == StagedSnapshotStates.Staged)
+        {
+            return;
+        }
+
+        if (staged.State == StagedSnapshotStates.ExportPrepared)
+        {
+            if (!string.IsNullOrWhiteSpace(staged.PreparedWorkbookPath) &&
+                File.Exists(staged.PreparedWorkbookPath))
+            {
+                if (string.IsNullOrWhiteSpace(staged.TargetWorkbookPath))
+                {
+                    throw new InvalidDataException("正式匯出交易缺少目標 Excel 路徑。");
+                }
+                if (!StagedOrderSnapshotStore.MatchesPreparedWorkbook(
+                        staged,
+                        staged.PreparedWorkbookPath))
+                {
+                    ShowUnrecoverablePreparedExport(
+                        "已備妥的 Excel 內容已改變，無法確認它屬於上次正式匯出。");
+                    return;
+                }
+
+                File.Move(staged.PreparedWorkbookPath, staged.TargetWorkbookPath, overwrite: true);
+            }
+            else if (string.IsNullOrWhiteSpace(staged.TargetWorkbookPath) ||
+                     !StagedOrderSnapshotStore.MatchesPreparedWorkbook(
+                         staged,
+                         staged.TargetWorkbookPath))
+            {
+                ShowUnrecoverablePreparedExport(
+                    "找不到本次已備妥的 Excel，或現有正式檔不是本次匯出的內容。");
+                return;
+            }
+
+            await _stagedOrderSnapshotStore.MarkExcelCommittedAsync(
+                staged.TransactionId,
+                staged.TargetWorkbookPath!,
+                staged.PendingManualState);
+            staged = await _stagedOrderSnapshotStore.GetAsync()
+                     ?? throw new InvalidDataException("正式匯出交易在復原期間遺失。");
+        }
+
+        if (string.IsNullOrWhiteSpace(staged.TargetWorkbookPath) ||
+            !File.Exists(staged.TargetWorkbookPath))
+        {
+            _statusLabel.Text = "正式 Excel 已完成，但快照尚待復原提交。";
+            MessageBox.Show(
+                this,
+                "上次正式匯出已完成，但找不到當時的 Excel，因此尚未提交正式快照。\n\n" +
+                "請把該 Excel 放回原路徑後重新開啟程式；在復原完成前請勿重新載入訂單。",
+                "正式快照尚待復原",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+        if (!StagedOrderSnapshotStore.MatchesPreparedWorkbook(
+                staged,
+                staged.TargetWorkbookPath))
+        {
+            ShowUnrecoverablePreparedExport(
+                "正式 Excel 已被替換或修改，無法確認它仍是本次匯出的內容。");
+            return;
+        }
+
+        _ = GiftBoxWorkbookExporter.ReadEditableRows(staged.TargetWorkbookPath);
+        if (staged.PendingManualState is not null)
+        {
+            await _manualOverrideStore.SaveAsync(staged.PendingManualState);
+        }
+        await _stagedOrderSnapshotStore.CommitAsync(staged.TransactionId, _orderSnapshotStore);
+        _statusLabel.Text = "已完成上次中斷的正式快照提交。";
+    }
+
+    private void ShowUnrecoverablePreparedExport(string reason)
+    {
+        _statusLabel.Text = "正式匯出交易無法自動復原。";
+        MessageBox.Show(
+            this,
+            $"上次正式匯出中斷：{reason}\n\n" +
+            "為避免把舊 Excel 與新快照錯配，程式已停止自動提交。請勿重新載入訂單，並聯絡維護人員檢查暫存交易。",
+            "正式匯出尚待人工檢查",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
+    }
+
+    private async Task MarkStagedExcelCommittedAsync(
+        SnapshotSelection selection,
+        string targetWorkbookPath,
+        ManualOverrideState pendingManualState)
+    {
+        if (!selection.IsStaged || string.IsNullOrWhiteSpace(selection.TransactionId))
+        {
+            return;
+        }
+
+        await _stagedOrderSnapshotStore.MarkExcelCommittedAsync(
+            selection.TransactionId,
+            targetWorkbookPath,
+            pendingManualState);
+    }
+
+    private async Task MarkStagedExportPreparedAsync(
+        SnapshotSelection selection,
+        string targetWorkbookPath,
+        string preparedWorkbookPath,
+        ManualOverrideState pendingManualState)
+    {
+        if (!selection.IsStaged || string.IsNullOrWhiteSpace(selection.TransactionId))
+        {
+            return;
+        }
+
+        await _stagedOrderSnapshotStore.MarkExportPreparedAsync(
+            selection.TransactionId,
+            targetWorkbookPath,
+            preparedWorkbookPath,
+            pendingManualState);
+    }
+
+    private async Task CommitMarkedStagedSnapshotAsync(SnapshotSelection selection)
+    {
+        if (!selection.IsStaged || string.IsNullOrWhiteSpace(selection.TransactionId))
+        {
+            return;
+        }
+
+        await _stagedOrderSnapshotStore.CommitAsync(
+            selection.TransactionId,
+            _orderSnapshotStore);
+    }
+
     private async Task LoadCredentialStatusAsync()
     {
         if (_sourceBox.SelectedItem is not WmsSource source)
@@ -344,7 +487,7 @@ internal sealed class MainForm : Form
             : "尚未保存憑證。";
         _savedStateLabel.ForeColor = display.HasSavedKey ? Color.SeaGreen : Color.DimGray;
         await LoadSyncStatusAsync(source.Code);
-        await LoadCommittedPreviewAsync(source);
+        await LoadPreferredPreviewAsync(source);
         UpdateOrderButtonState();
     }
 
@@ -409,8 +552,9 @@ internal sealed class MainForm : Form
                 sharedWindow));
         }
 
-        await _orderSnapshotStore.ReplaceAllAsync(
-            batches.SelectMany(batch => batch.Snapshots).ToArray());
+        var staged = await _stagedOrderSnapshotStore.StageAsync(
+            batches.SelectMany(batch => batch.Snapshots).ToArray(),
+            DateTimeOffset.Now);
 
         foreach (var batch in batches)
         {
@@ -434,8 +578,8 @@ internal sealed class MainForm : Form
 
         var selected = SelectedSource;
         await LoadSyncStatusAsync(selected.Code);
-        await LoadCommittedPreviewAsync(selected);
-        return "兩個網站完整訂單已一起更新；只保留目前仍在待處理頁面的訂單。";
+        await LoadPreferredPreviewAsync(selected);
+        return $"兩個網站完整訂單已載入暫存，尚未正式匯出；載入時間：{staged.StagedAt:yyyy/MM/dd HH:mm:ss}。";
     }
 
     private async Task<CompleteSourceReload> FetchCompleteSourceAsync(
@@ -551,24 +695,26 @@ internal sealed class MainForm : Form
         _syncStatusLabel.ForeColor = status.Status == "success" ? Color.SeaGreen : Color.Firebrick;
     }
 
-    private async Task LoadCommittedPreviewAsync(WmsSource source)
+    private async Task LoadPreferredPreviewAsync(WmsSource source)
     {
         try
         {
-            var snapshot = await _orderSnapshotStore.GetAllAsync();
+            var selection = await _stagedOrderSnapshotStore.GetPreferredAsync(_orderSnapshotStore);
             if (_sourceBox.SelectedItem is not WmsSource selected ||
                 !selected.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
             {
                 return;
             }
 
-            var sourceLines = snapshot
+            var sourceLines = selection.Lines
                 .Where(line => line.SourceCode.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
             if (sourceLines.Length == 0)
             {
                 _grid.DataSource = null;
-                _previewMetadataLabel.Text = "此來源目前沒有待處理訂單。";
+                _previewMetadataLabel.Text = selection.IsStaged
+                    ? $"此來源暫存資料目前沒有待處理訂單；尚未正式匯出，載入時間：{selection.StagedAt:yyyy/MM/dd HH:mm:ss}。"
+                    : "此來源目前沒有待處理訂單。";
                 return;
             }
 
@@ -586,6 +732,11 @@ internal sealed class MainForm : Form
                 current.Code.Equals(source.Code, StringComparison.OrdinalIgnoreCase))
             {
                 ShowPreview(OrderSnapshotPreviewBuilder.Build(source, sourceLines, status));
+                if (selection.IsStaged)
+                {
+                    _previewMetadataLabel.Text +=
+                        $"　狀態：尚未正式匯出　載入時間：{selection.StagedAt:yyyy/MM/dd HH:mm:ss}";
+                }
             }
         }
         catch (Exception exception) when (IsSyncStatusStorageError(exception))
@@ -789,9 +940,10 @@ internal sealed class MainForm : Form
             MessageBox.Show(
                 this,
                 "快速流程已完成。\n\n" +
-                string.Join("\n", importSummaries.Select(summary => $"• {summary}")) +
-                $"\n\n• {synchronizationSummary}\n• 已匯出：{inputs.OutputPath}\n\n" +
-                "既有人工修改已保留；快速流程不會清除人工覆寫。",
+                 string.Join("\n", importSummaries.Select(summary => $"• {summary}")) +
+                 $"\n\n• {synchronizationSummary}\n• 已匯出：{inputs.OutputPath}\n\n" +
+                 "既有人工修改已保留；快速流程不會清除人工覆寫。\n" +
+                 "本次正式匯出已更新下次補單的送廠比較基準。",
                 "快速流程完成",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -811,7 +963,8 @@ internal sealed class MainForm : Form
     private async Task ExportQuickPreviewAsync(string path)
     {
         using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
-        var snapshots = await _orderSnapshotStore.GetAllAsync();
+        var selection = await _stagedOrderSnapshotStore.GetPreferredAsync(_orderSnapshotStore);
+        var snapshots = selection.Lines;
         var wmsEntries = CurrentSnapshotOrderProjector.Project(
             snapshots,
             Sources.ToDictionary(
@@ -843,35 +996,50 @@ internal sealed class MainForm : Form
         effectiveEntries = ManualOverrideWorkflow.ApplyAutomaticResets(
             effectiveEntries,
             manualState.PendingAutomaticResets ?? []);
-        var preparedPath = PrepareWorkbook(fullPath, effectiveEntries);
+        selection = await _stagedOrderSnapshotStore.EnsureForFormalExportAsync(
+            selection,
+            DateTimeOffset.Now);
+        var preparedPath = PrepareWorkbook(
+            fullPath,
+            effectiveEntries,
+            manualState.LastFactorySubmission);
+        var preservePreparedForRecovery = false;
         try
         {
             var exportedRows = GiftBoxWorkbookExporter.ReadEditableRows(preparedPath);
-            await _manualOverrideStore.SaveAsync(manualState with
+            var factorySubmission = GiftBoxWorkbookExporter.CreateFactorySubmissionSnapshot(
+                effectiveEntries,
+                DateTimeOffset.Now,
+                fullPath);
+            var nextManualState = manualState with
             {
                 LastWorkbookPath = fullPath,
                 LastExportedRows = exportedRows,
-                PendingAutomaticResets = []
-            });
-            try
-            {
-                File.Move(preparedPath, fullPath, overwrite: true);
-            }
-            catch
-            {
-                await _manualOverrideStore.SaveAsync(manualState);
-                throw;
-            }
+                PendingAutomaticResets = [],
+                LastFactorySubmission = factorySubmission
+            };
+
+            await MarkStagedExportPreparedAsync(
+                selection,
+                fullPath,
+                preparedPath,
+                nextManualState);
+            preservePreparedForRecovery = selection.IsStaged;
+            File.Move(preparedPath, fullPath, overwrite: true);
+            await MarkStagedExcelCommittedAsync(selection, fullPath, nextManualState);
+            await _manualOverrideStore.SaveAsync(nextManualState);
+            await CommitMarkedStagedSnapshotAsync(selection);
         }
         finally
         {
-            if (File.Exists(preparedPath)) File.Delete(preparedPath);
+            if (!preservePreparedForRecovery && File.Exists(preparedPath)) File.Delete(preparedPath);
         }
     }
 
     private static string PrepareWorkbook(
         string fullPath,
-        IReadOnlyList<OrderChangeEntry> entries)
+        IReadOnlyList<OrderChangeEntry> entries,
+        FactorySubmissionSnapshot? previousFactorySubmission)
     {
         var directory = Path.GetDirectoryName(fullPath)
                         ?? throw new InvalidOperationException("固定匯出路徑缺少資料夾。");
@@ -886,7 +1054,7 @@ internal sealed class MainForm : Form
                 File.Copy(fullPath, temporaryPath, overwrite: false);
             }
 
-            GiftBoxWorkbookExporter.Export(temporaryPath, entries);
+            GiftBoxWorkbookExporter.Export(temporaryPath, entries, previousFactorySubmission);
             return temporaryPath;
         }
         catch
@@ -978,15 +1146,82 @@ internal sealed class MainForm : Form
         return table;
     }
 
-    private async Task ExportPreviewAsync()
+    private async Task ExportTestPreviewAsync()
     {
-        IReadOnlyList<OrderChangeEntry> changeEntries;
-        IReadOnlyList<OrderLineSnapshot> snapshots;
-        ManualOverrideState manualState;
         try
         {
             using var workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
-            snapshots = await _orderSnapshotStore.GetAllAsync();
+            var selection = await _stagedOrderSnapshotStore.GetPreferredAsync(_orderSnapshotStore);
+            var wmsEntries = CurrentSnapshotOrderProjector.Project(
+                selection.Lines,
+                Sources.ToDictionary(
+                    source => source.Code,
+                    source => source.Name,
+                    StringComparer.OrdinalIgnoreCase),
+                DateTimeOffset.Now);
+            var changeEntries = wmsEntries
+                .Concat(_erpBatch?.ExportEntries ?? [])
+                .Concat(_manualExcelBatch?.ExportEntries ?? [])
+                .Concat(_posBatch?.ExportEntries ?? [])
+                .ToArray();
+            if (changeEntries.Length == 0)
+            {
+                MessageBox.Show(this, "請先重新載入網站訂單或載入來源 Excel。", "尚無可匯出資料",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var automaticEntries = GiftBoxWorkbookExporter.ResolveEntries(changeEntries, selection.Lines);
+
+            using var dialog = new SaveFileDialog
+            {
+                Title = "建立測試 Excel（不保存正式狀態）",
+                Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
+                DefaultExt = "xlsx",
+                AddExtension = true,
+                OverwritePrompt = false,
+                FileName = $"中秋禮盒訂單統計-測試-{DateTime.Now:yyyyMMdd-HHmmss}.xlsx"
+            };
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            await TestWorkbookExportWorkflow.ExportNewAsync(
+                dialog.FileName,
+                automaticEntries,
+                _manualOverrideStore);
+            _statusLabel.Text = $"測試 Excel 已建立（未保存正式狀態）：{dialog.FileName}";
+            MessageBox.Show(
+                this,
+                "測試 Excel 已建立。\n\n「本次補單」只供預覽；這次操作沒有覆寫既有 Excel，也沒有更新送廠比較基準、正式快照、人工覆寫或上次匯出路徑。",
+                "測試匯出完成",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception exception) when (IsExpectedOperationException(exception))
+        {
+            _statusLabel.Text = "測試匯出失敗，正式狀態未變更。";
+            MessageBox.Show(
+                this,
+                $"無法建立測試 Excel：{exception.Message}\n\n請選擇一個尚不存在的新檔名。正式資料未被修改。",
+                "測試匯出失敗",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private async Task ExportPreviewAsync()
+    {
+        IReadOnlyList<OrderChangeEntry> changeEntries;
+        SnapshotSelection selection;
+        ManualOverrideState manualState;
+        IDisposable? workflowLock = null;
+        try
+        {
+            workflowLock = await _historyResetService.AcquireWorkflowLockAsync();
+            selection = await _stagedOrderSnapshotStore.GetPreferredAsync(_orderSnapshotStore);
+            var snapshots = selection.Lines;
             var wmsEntries = CurrentSnapshotOrderProjector.Project(
                 snapshots,
                 Sources.ToDictionary(
@@ -1002,6 +1237,7 @@ internal sealed class MainForm : Form
             manualState = await _manualOverrideStore.LoadAsync();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                          InvalidOperationException or InvalidDataException or
                                           System.Text.Json.JsonException)
         {
             MessageBox.Show(this, $"無法讀取異動紀錄：{exception.Message}", "匯出失敗",
@@ -1009,20 +1245,9 @@ internal sealed class MainForm : Form
             return;
         }
 
-        ManualOverrideState? capturedState;
-        try
+        using (workflowLock)
         {
-            capturedState = await CaptureLastWorkbookChangesAsync(manualState);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
-                                          InvalidOperationException or InvalidDataException or
-                                          System.Xml.XmlException or System.Text.Json.JsonException)
-        {
-            MessageBox.Show(this,
-                $"無法讀取上次正式 Excel 的人工修改：{exception.Message}\n\n請關閉 Excel 後重試，或把正確舊檔放回原路徑。",
-                "人工修改讀取失敗", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
+        var capturedState = await CaptureLastWorkbookChangesWithRecoveryAsync(manualState);
         if (capturedState is null)
         {
             return;
@@ -1058,7 +1283,7 @@ internal sealed class MainForm : Form
 
         try
         {
-            var automaticEntries = GiftBoxWorkbookExporter.ResolveEntries(changeEntries, snapshots);
+            var automaticEntries = GiftBoxWorkbookExporter.ResolveEntries(changeEntries, selection.Lines);
             if (manualState.LastWorkbookPath is null && File.Exists(dialog.FileName))
             {
                 manualState = CaptureFirstExistingWorkbook(
@@ -1071,29 +1296,136 @@ internal sealed class MainForm : Form
             effectiveEntries = ManualOverrideWorkflow.ApplyAutomaticResets(
                 effectiveEntries,
                 manualState.PendingAutomaticResets ?? []);
-            GiftBoxWorkbookExporter.Export(dialog.FileName, effectiveEntries);
-            var exportedRows = GiftBoxWorkbookExporter.ReadEditableRows(dialog.FileName);
-            manualState = manualState with
+            selection = await _stagedOrderSnapshotStore.EnsureForFormalExportAsync(
+                selection,
+                DateTimeOffset.Now);
+            var preparedPath = PrepareWorkbook(
+                dialog.FileName,
+                effectiveEntries,
+                manualState.LastFactorySubmission);
+            var preservePreparedForRecovery = false;
+            try
             {
-                LastWorkbookPath = Path.GetFullPath(dialog.FileName),
-                LastExportedRows = exportedRows,
-                PendingAutomaticResets = []
-            };
-            await _manualOverrideStore.SaveAsync(manualState);
+                var exportedRows = GiftBoxWorkbookExporter.ReadEditableRows(preparedPath);
+                var factorySubmission = GiftBoxWorkbookExporter.CreateFactorySubmissionSnapshot(
+                    effectiveEntries,
+                    DateTimeOffset.Now,
+                    dialog.FileName);
+                manualState = manualState with
+                {
+                    LastWorkbookPath = Path.GetFullPath(dialog.FileName),
+                    LastExportedRows = exportedRows,
+                    PendingAutomaticResets = [],
+                    LastFactorySubmission = factorySubmission
+                };
+                await MarkStagedExportPreparedAsync(
+                    selection,
+                    dialog.FileName,
+                    preparedPath,
+                    manualState);
+                preservePreparedForRecovery = selection.IsStaged;
+                File.Move(preparedPath, dialog.FileName, overwrite: true);
+                await MarkStagedExcelCommittedAsync(selection, dialog.FileName, manualState);
+                while (true)
+                {
+                    try
+                    {
+                        await _manualOverrideStore.SaveAsync(manualState);
+                        break;
+                    }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                                      System.Text.Json.JsonException)
+                    {
+                        var retry = MessageBox.Show(
+                            this,
+                            $"Excel 已成功建立：\n{dialog.FileName}\n\n" +
+                            $"但程式無法保存這份 Excel 的人工修改追蹤狀態：{exception.Message}\n\n" +
+                            (selection.IsStaged
+                                ? "按「重試」再次保存；按「取消」結束。程式會在下次啟動時復原，在此之前請勿修改新 Excel。"
+                                : "按「重試」再次保存；按「取消」結束。取消後請勿修改新 Excel，否則下次可能無法自動讀回。"),
+                            "Excel 已建立，但追蹤狀態未保存",
+                            MessageBoxButtons.RetryCancel,
+                            MessageBoxIcon.Warning,
+                            MessageBoxDefaultButton.Button1);
+                        if (retry == DialogResult.Retry) continue;
+                        _statusLabel.Text = selection.IsStaged
+                            ? $"Excel 已建立；追蹤狀態會在下次啟動時復原：{dialog.FileName}"
+                            : $"Excel 已建立，但追蹤狀態未保存：{dialog.FileName}";
+                        return;
+                    }
+                }
+                await CommitMarkedStagedSnapshotAsync(selection);
+            }
+            finally
+            {
+                if (!preservePreparedForRecovery && File.Exists(preparedPath)) File.Delete(preparedPath);
+            }
+            await LoadPreferredPreviewAsync(SelectedSource);
             _statusLabel.Text = $"Excel 已匯出：{dialog.FileName}";
             MessageBox.Show(this,
-                "Excel 匯出完成。\n包含「訂單明細」、「日期待確認」、「統計」三張工作表。\n" +
+                "Excel 匯出完成。\n包含「訂單明細」、「日期待確認」、「統計」、「本次補單」四張工作表。\n" +
                 "所有入數依來源、訂單編號、品名與指定到貨日逐筆列出；統計數量使用 Excel 原生公式。\n" +
-                "下次匯出前會讀回人工修改的指定到貨日、下單日、地點與確認，包含刻意留空的值。",
+                "「本次補單」以正負數顯示本次正式送廠數量和上次正式送廠快照的差額。\n" +
+                "本次正式匯出已更新下次比較基準；下次匯出前仍會讀回人工修改的指定到貨日、下單日、地點與確認，包含刻意留空的值。",
                 "匯出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
-                                          InvalidOperationException or ArgumentException or System.Xml.XmlException or
+                                          InvalidOperationException or InvalidDataException or
+                                          ArgumentException or System.Xml.XmlException or
                                           System.Text.Json.JsonException)
         {
             _statusLabel.Text = "Excel 匯出失敗";
             MessageBox.Show(this, $"無法匯出 Excel：{exception.Message}", "匯出失敗",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        }
+    }
+
+    private async Task<ManualOverrideState?> CaptureLastWorkbookChangesWithRecoveryAsync(
+        ManualOverrideState state)
+    {
+        while (true)
+        {
+            try
+            {
+                return await CaptureLastWorkbookChangesAsync(state);
+            }
+            catch (InvalidDataException exception)
+            {
+                var choice = MessageBox.Show(
+                    this,
+                    $"無法讀取上次正式 Excel 的人工修改：{exception.Message}\n\n" +
+                    "按「是」可改選另一份舊正式 Excel；按「否」保留已保存的人工覆寫並另存新版；按「取消」停止。\n\n" +
+                    "若舊檔還有尚未被程式保存的人工修改，選擇另存新版後不會自動帶入。",
+                    "舊正式 Excel 格式不符",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button3);
+                if (choice == DialogResult.Cancel) return null;
+                if (choice == DialogResult.No)
+                {
+                    return ManualOverrideWorkflow.ContinueWithNewWorkbook(state);
+                }
+
+                using var open = new OpenFileDialog
+                {
+                    Title = "選擇先前正式匯出的 Excel",
+                    Filter = "Excel 活頁簿 (*.xlsx)|*.xlsx",
+                    CheckFileExists = true,
+                    Multiselect = false
+                };
+                if (open.ShowDialog(this) != DialogResult.OK) return null;
+                state = state with { LastWorkbookPath = Path.GetFullPath(open.FileName) };
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                              InvalidOperationException or System.Xml.XmlException or
+                                              System.Text.Json.JsonException)
+            {
+                MessageBox.Show(this,
+                    $"無法讀取上次正式 Excel 的人工修改：{exception.Message}\n\n請關閉 Excel 後重試，或把正確舊檔放回原路徑。",
+                    "人工修改讀取失敗", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
         }
     }
 
@@ -1355,6 +1687,7 @@ internal sealed class MainForm : Form
         _shopsButton.Enabled = !busy;
         _ordersButton.Enabled = !busy && _sourceBox.SelectedItem is WmsSource;
         _exportButton.Enabled = !busy;
+        _testExportButton.Enabled = !busy;
         _clearOverridesButton.Enabled = !busy;
         _loadErpFileButton.Enabled = !busy;
         _loadManualExcelButton.Enabled = !busy;

@@ -207,15 +207,8 @@ public static class OrderChangePlanner
         GiftBoxSizePolicy.ResolveParent(parent, sourceSnapshot);
 
     private static string? ResolveDeliveryDate(OrderLineSnapshot line) =>
-        ShippingLeadTimePolicy.Resolve(
-            line.DerivedShippingDate,
-            line.ArrivalDate,
-            line.ShippingDateStatus);
+        WmsDepartmentStoreDatePolicy.ResolveOrderDate(line);
 
     private static string? ResolveOriginalDeliveryDate(OrderLineSnapshot line) =>
-        ShippingLeadTimePolicy.ResolveOriginal(
-            line.ShipWindowStart,
-            line.ShipWindowEnd,
-            line.ArrivalDate,
-            line.ShippingDateStatus);
+        WmsDepartmentStoreDatePolicy.ResolveDeliveryDate(line);
 }

@@ -10,25 +10,29 @@ namespace MidAutumnGiftBox.Core;
 public static class GiftBoxWorkbookExporter
 {
     private static readonly IReadOnlyDictionary<string, string> WebsiteChannelLocations =
-        new Dictionary<string, string>(StringComparer.Ordinal)
+        BuildWebsiteChannelLocations();
+
+    private static IReadOnlyDictionary<string, string> BuildWebsiteChannelLocations()
+    {
+        var locations = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["蝦皮賣場"] = "創鵬",
             ["電子商務-二聯客戶"] = "彰廠",
-            ["正-新光A4"] = "彰廠",
-            ["正-台中高鐵"] = "彰廠",
-            ["臨新竹大全聯"] = "彰廠",
-            ["正-夢時代"] = "彰廠",
-            ["正-京站"] = "彰廠",
             ["MOMO"] = "創鵬",
             ["好的文創"] = "彰廠",
             ["美安"] = "創鵬",
             ["YAHOO"] = "彰廠",
             ["阿瘦"] = "彰廠",
-            ["臨新莊宏匯"] = "彰廠",
-            ["臨桃園大江"] = "彰廠",
-            ["臨大葉高島屋"] = "彰廠",
-            ["臨新光三越台南新天地"] = "彰廠"
+            ["PCHOME"] = "彰廠",
+            ["i預購"] = "彰廠"
         };
+        foreach (var channel in WmsDepartmentStoreDatePolicy.AllChannels)
+        {
+            locations[channel] = "彰廠";
+        }
+
+        return locations;
+    }
     private const string SpreadsheetNamespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     private static readonly string[] DetailHeaders =
         ["通路別", "品名", "指定到貨日", "下單日", "數量", "確認", "地點", "訂單編號", "備註", "訂單鍵", "來源明細指紋"];
@@ -48,6 +52,7 @@ public static class GiftBoxWorkbookExporter
         "6入鐵盒2026年鐵盒(黑金袋)",
         "9入紙盒3入禮盒紙盒(黑金袋＋3包7g芝麻粉)"
     ];
+    private static readonly string[] FactoryDeltaHeaders = StatisticsHeaders;
     private static readonly string[][] LegacyStatisticsHeaders =
     [
         ["下單日", "地點", "一入", "三入", "六入", "九入", "合計"],
@@ -59,6 +64,8 @@ public static class GiftBoxWorkbookExporter
     private const string PendingDateSheetPath = "xl/worksheets/sheet2.xml";
     private const string StatisticsSheetName = "統計";
     private const string StatisticsSheetPath = "xl/worksheets/sheet3.xml";
+    private const string FactoryDeltaSheetName = "本次補單";
+    private const string FactoryDeltaSheetPath = "xl/worksheets/sheet4.xml";
     private static readonly XmlWriterSettings XmlSettings = new()
     {
         Encoding = new UTF8Encoding(false),
@@ -67,6 +74,28 @@ public static class GiftBoxWorkbookExporter
     };
 
     public static void Export(string path, IReadOnlyList<OrderChangeEntry> entries)
+        => ExportCore(path, entries, previousFactorySubmission: null, allowExisting: true);
+
+    public static void Export(
+        string path,
+        IReadOnlyList<OrderChangeEntry> entries,
+        FactorySubmissionSnapshot? previousFactorySubmission)
+        => ExportCore(path, entries, previousFactorySubmission, allowExisting: true);
+
+    public static void ExportNew(string path, IReadOnlyList<OrderChangeEntry> entries)
+        => ExportCore(path, entries, previousFactorySubmission: null, allowExisting: false);
+
+    public static void ExportNew(
+        string path,
+        IReadOnlyList<OrderChangeEntry> entries,
+        FactorySubmissionSnapshot? previousFactorySubmission)
+        => ExportCore(path, entries, previousFactorySubmission, allowExisting: false);
+
+    private static void ExportCore(
+        string path,
+        IReadOnlyList<OrderChangeEntry> entries,
+        FactorySubmissionSnapshot? previousFactorySubmission,
+        bool allowExisting)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(entries);
@@ -80,7 +109,12 @@ public static class GiftBoxWorkbookExporter
 
         if (File.Exists(fullPath))
         {
-            AppendExisting(fullPath, entries);
+            if (!allowExisting)
+            {
+                throw new InvalidOperationException("測試匯出只能建立新檔，不能覆寫既有 Excel。");
+            }
+
+            AppendExisting(fullPath, entries, previousFactorySubmission);
             return;
         }
 
@@ -95,6 +129,21 @@ public static class GiftBoxWorkbookExporter
         WriteDetailWorksheet(archive, details, []);
         WritePendingDateWorksheet(archive, PendingDateAggregates(entries), []);
         WriteStatisticsWorksheet(archive, details);
+        WriteFactoryDeltaWorksheet(archive, details, previousFactorySubmission);
+    }
+
+    public static FactorySubmissionSnapshot CreateFactorySubmissionSnapshot(
+        IReadOnlyList<OrderChangeEntry> effectiveEntries,
+        DateTimeOffset submittedAt,
+        string workbookPath)
+    {
+        ArgumentNullException.ThrowIfNull(effectiveEntries);
+        ArgumentException.ThrowIfNullOrWhiteSpace(workbookPath);
+        var lines = BuildFactorySubmissionLines(DetailAggregates(effectiveEntries));
+        return new FactorySubmissionSnapshot(
+            submittedAt,
+            Path.GetFullPath(workbookPath),
+            lines);
     }
 
     public static void Export(
@@ -120,15 +169,8 @@ public static class GiftBoxWorkbookExporter
                 {
                     var snapshot = group.OrderByDescending(item => item.SynchronizedAt).First();
                     return new SnapshotDateResolution(
-                        ShippingLeadTimePolicy.ResolveOriginal(
-                            snapshot.ShipWindowStart,
-                            snapshot.ShipWindowEnd,
-                            snapshot.ArrivalDate,
-                            snapshot.ShippingDateStatus),
-                        ShippingLeadTimePolicy.Resolve(
-                            snapshot.DerivedShippingDate,
-                            snapshot.ArrivalDate,
-                            snapshot.ShippingDateStatus),
+                        WmsDepartmentStoreDatePolicy.ResolveDeliveryDate(snapshot),
+                        WmsDepartmentStoreDatePolicy.ResolveOrderDate(snapshot),
                         IsDateBlocked(snapshot.ShippingDateStatus),
                         ResolveSnapshotGiftBoxSize(snapshot, snapshots),
                         snapshot.Note);
@@ -430,7 +472,10 @@ public static class GiftBoxWorkbookExporter
             .ThenBy(aggregate => aggregate.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-    private static void AppendExisting(string fullPath, IReadOnlyList<OrderChangeEntry> entries)
+    private static void AppendExisting(
+        string fullPath,
+        IReadOnlyList<OrderChangeEntry> entries,
+        FactorySubmissionSnapshot? previousFactorySubmission)
     {
         var temporaryPath = fullPath + $".{Guid.NewGuid():N}.tmp";
         try
@@ -442,10 +487,13 @@ public static class GiftBoxWorkbookExporter
                 ValidateWorkbook(archive);
                 EnsureStyleParts(archive);
                 EnsureCalculationSettings(archive);
+                EnsureFactoryDeltaWorksheetRegistered(archive);
                 var details = DetailAggregates(entries);
                 RewriteDetailWorksheet(archive, details);
                 RewritePendingDateWorksheet(archive, PendingDateAggregates(entries));
                 RewriteStatisticsWorksheet(archive, details);
+                RewriteFactoryDeltaWorksheet(archive, details, previousFactorySubmission);
+                RemoveCalculationChain(archive);
             }
 
             File.Move(temporaryPath, fullPath, overwrite: true);
@@ -473,11 +521,14 @@ public static class GiftBoxWorkbookExporter
                 .Where(name => name is not null)
                 .ToArray();
         }
-        string[] expectedNames = [DetailSheetName, PendingDateSheetName, StatisticsSheetName];
-        if (!names.SequenceEqual(expectedNames, StringComparer.Ordinal))
+        string[] legacyNames = [DetailSheetName, PendingDateSheetName, StatisticsSheetName];
+        string[] currentNames =
+            [DetailSheetName, PendingDateSheetName, StatisticsSheetName, FactoryDeltaSheetName];
+        var hasFactoryDeltaSheet = names.SequenceEqual(currentNames, StringComparer.Ordinal);
+        if (!hasFactoryDeltaSheet && !names.SequenceEqual(legacyNames, StringComparer.Ordinal))
         {
             throw new InvalidDataException(
-                "選取的 Excel 不是含有「訂單明細、日期待確認、統計」的新版中秋禮盒統計活頁簿，請另存新檔。");
+                "選取的 Excel 不是含有「訂單明細、日期待確認、統計、本次補單」的中秋禮盒統計活頁簿，請另存新檔。");
         }
 
         var sharedStrings = ReadSharedStrings(archive, spreadsheet);
@@ -536,6 +587,23 @@ public static class GiftBoxWorkbookExporter
                 statisticsHeaders.SequenceEqual(legacy, StringComparer.Ordinal)))
         {
             throw new InvalidDataException("統計工作表格式不正確，請另存新檔。");
+        }
+
+        if (hasFactoryDeltaSheet)
+        {
+            var factoryDeltaEntry = archive.GetEntry(FactoryDeltaSheetPath)
+                ?? throw new InvalidDataException("選取的 Excel 缺少本次補單工作表，請另存新檔。");
+            using var factoryDeltaInput = factoryDeltaEntry.Open();
+            var factoryDeltaDocument = XDocument.Load(factoryDeltaInput);
+            var factoryDeltaFirstRow = factoryDeltaDocument.Descendants(spreadsheet + "row")
+                .FirstOrDefault(row => (string?)row.Attribute("r") == "1");
+            var factoryDeltaHeaders = factoryDeltaFirstRow?.Elements(spreadsheet + "c")
+                .Select(cell => ReadCellText(cell, spreadsheet, sharedStrings))
+                .ToArray() ?? [];
+            if (!factoryDeltaHeaders.SequenceEqual(FactoryDeltaHeaders, StringComparer.Ordinal))
+            {
+                throw new InvalidDataException("本次補單工作表格式不正確，請另存新檔。");
+            }
         }
     }
 
@@ -722,6 +790,145 @@ public static class GiftBoxWorkbookExporter
         WriteStatisticsWorksheet(archive, aggregates);
     }
 
+    private static IReadOnlyList<FactorySubmissionLine> BuildFactorySubmissionLines(
+        IReadOnlyList<OrderAggregate> aggregates) =>
+        aggregates
+            .Select(aggregate => new FactorySubmissionLine(
+                aggregate.OrderDate,
+                aggregate.OriginalDeliveryDate,
+                ResolveLocation(aggregate, []),
+                aggregate.ProductName,
+                aggregate.Quantity))
+            .GroupBy(FactorySubmissionLineKey, StringComparer.Ordinal)
+            .Select(group => group.First() with { Quantity = group.Sum(line => line.Quantity) })
+            .Where(line => line.Quantity != 0m)
+            .OrderBy(line => line.OrderDate, StringComparer.Ordinal)
+            .ThenBy(line => line.DeliveryDate, StringComparer.Ordinal)
+            .ThenBy(line => line.Location, StringComparer.Ordinal)
+            .ThenBy(line => line.ProductName, StringComparer.Ordinal)
+            .ToArray();
+
+    private static IReadOnlyList<FactoryDeltaRow> BuildFactoryDeltaRows(
+        IReadOnlyList<OrderAggregate> aggregates,
+        FactorySubmissionSnapshot? previousFactorySubmission)
+    {
+        var products = FactoryDeltaHeaders.Skip(3).ToArray();
+        var current = BuildFactorySubmissionLines(aggregates);
+        var previous = (previousFactorySubmission?.Lines ?? [])
+            .Select(NormalizeFactorySubmissionLine)
+            .GroupBy(FactorySubmissionLineKey, StringComparer.Ordinal)
+            .Select(group => group.First() with { Quantity = group.Sum(line => line.Quantity) })
+            .Where(line => line.Quantity != 0m)
+            .ToArray();
+        var currentByKey = current
+            .GroupBy(FactorySubmissionGroupKey, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.GroupBy(line => line.ProductName, StringComparer.Ordinal)
+                    .ToDictionary(
+                        product => product.Key,
+                        product => product.Sum(line => line.Quantity),
+                        StringComparer.Ordinal),
+                StringComparer.Ordinal);
+        var previousByKey = previous
+            .GroupBy(FactorySubmissionGroupKey, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.GroupBy(line => line.ProductName, StringComparer.Ordinal)
+                    .ToDictionary(
+                        product => product.Key,
+                        product => product.Sum(line => line.Quantity),
+                        StringComparer.Ordinal),
+                StringComparer.Ordinal);
+        return currentByKey.Keys
+            .Concat(previousByKey.Keys)
+            .Distinct(StringComparer.Ordinal)
+            .Select(key =>
+            {
+                currentByKey.TryGetValue(key, out var currentProducts);
+                previousByKey.TryGetValue(key, out var previousProducts);
+                var sample = current.FirstOrDefault(line => FactorySubmissionGroupKey(line) == key)
+                             ?? previous.First(line => FactorySubmissionGroupKey(line) == key);
+                var previousQuantities = products.ToDictionary(
+                    product => product,
+                    product => previousProducts?.GetValueOrDefault(product) ?? 0m,
+                    StringComparer.Ordinal);
+                var deltas = products.ToDictionary(
+                    product => product,
+                    product => (currentProducts?.GetValueOrDefault(product) ?? 0m) -
+                               previousQuantities[product],
+                    StringComparer.Ordinal);
+                return new FactoryDeltaRow(
+                    sample.OrderDate,
+                    sample.DeliveryDate,
+                    sample.Location,
+                    previousQuantities,
+                    deltas);
+            })
+            .Where(row => row.Deltas.Values.Any(value => value != 0m))
+            .OrderBy(row => row.OrderDate, StringComparer.Ordinal)
+            .ThenBy(row => row.DeliveryDate, StringComparer.Ordinal)
+            .ThenBy(row => row.Location, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static void WriteFactoryDeltaWorksheet(
+        ZipArchive archive,
+        IReadOnlyList<OrderAggregate> aggregates,
+        FactorySubmissionSnapshot? previousFactorySubmission)
+    {
+        var entry = archive.CreateEntry(FactoryDeltaSheetPath, CompressionLevel.Optimal);
+        using var stream = entry.Open();
+        using var writer = XmlWriter.Create(stream, XmlSettings);
+        writer.WriteStartDocument(true);
+        writer.WriteStartElement("worksheet", SpreadsheetNamespace);
+        writer.WriteStartElement("sheetData", SpreadsheetNamespace);
+        WriteHeaderRow(writer, FactoryDeltaHeaders);
+        var rows = BuildFactoryDeltaRows(aggregates, previousFactorySubmission);
+        var detailLastRow = Math.Max(2, aggregates.Count + 1);
+        for (var index = 0; index < rows.Count; index++)
+        {
+            var rowNumber = index + 2;
+            var row = rows[index];
+            writer.WriteStartElement("row", SpreadsheetNamespace);
+            writer.WriteAttributeString("r", rowNumber.ToString(CultureInfo.InvariantCulture));
+            WriteDateCell(writer, $"A{rowNumber}", row.OrderDate);
+            WriteDateCell(writer, $"B{rowNumber}", row.DeliveryDate);
+            WriteTextCell(writer, $"C{rowNumber}",
+                string.IsNullOrWhiteSpace(row.Location) ? "未設定" : row.Location);
+            for (var productIndex = 0; productIndex < 8; productIndex++)
+            {
+                var column = ColumnName(productIndex + 4);
+                var product = FactoryDeltaHeaders[productIndex + 3];
+                var previousQuantity = row.PreviousQuantities[product];
+                var formula = $"SUMIFS('訂單明細'!$E$2:$E${detailLastRow}," +
+                              $"'訂單明細'!$D$2:$D${detailLastRow},$A{rowNumber}," +
+                              $"'訂單明細'!$C$2:$C${detailLastRow},$B{rowNumber}," +
+                              $"'訂單明細'!$G$2:$G${detailLastRow},IF($C{rowNumber}=\"未設定\",\"\",$C{rowNumber})," +
+                              $"'訂單明細'!$B$2:$B${detailLastRow},{column}$1)-" +
+                              previousQuantity.ToString(CultureInfo.InvariantCulture);
+                WriteFormulaCell(
+                    writer,
+                    $"{column}{rowNumber}",
+                    formula,
+                    cachedValue: row.Deltas[product]);
+            }
+            writer.WriteEndElement();
+        }
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        writer.WriteEndDocument();
+    }
+
+    private static void RewriteFactoryDeltaWorksheet(
+        ZipArchive archive,
+        IReadOnlyList<OrderAggregate> aggregates,
+        FactorySubmissionSnapshot? previousFactorySubmission)
+    {
+        archive.GetEntry(FactoryDeltaSheetPath)?.Delete();
+        WriteFactoryDeltaWorksheet(archive, aggregates, previousFactorySubmission);
+    }
+
     private static void WriteHiddenIdColumns(XmlWriter writer, int minimum, int maximum)
     {
         writer.WriteStartElement("cols", SpreadsheetNamespace);
@@ -824,7 +1031,8 @@ public static class GiftBoxWorkbookExporter
         XmlWriter writer,
         string reference,
         string formula,
-        int styleIndex = 1)
+        int styleIndex = 1,
+        decimal? cachedValue = null)
     {
         writer.WriteStartElement("c", SpreadsheetNamespace);
         writer.WriteAttributeString("r", reference);
@@ -833,6 +1041,10 @@ public static class GiftBoxWorkbookExporter
         writer.WriteString(formula);
         writer.WriteEndElement();
         writer.WriteStartElement("v", SpreadsheetNamespace);
+        if (cachedValue is not null)
+        {
+            writer.WriteString(cachedValue.Value.ToString(CultureInfo.InvariantCulture));
+        }
         writer.WriteEndElement();
         writer.WriteEndElement();
     }
@@ -1043,6 +1255,27 @@ public static class GiftBoxWorkbookExporter
             : normalized;
     }
 
+    private static FactorySubmissionLine NormalizeFactorySubmissionLine(
+        FactorySubmissionLine line) => line with
+    {
+        OrderDate = NormalizeDate(line.OrderDate),
+        DeliveryDate = NormalizeDate(line.DeliveryDate),
+        Location = line.Location?.Trim() ?? string.Empty,
+        ProductName = line.ProductName?.Trim() ?? string.Empty
+    };
+
+    private static string FactorySubmissionLineKey(FactorySubmissionLine line)
+    {
+        var normalized = NormalizeFactorySubmissionLine(line);
+        return $"{FactorySubmissionGroupKey(normalized)}\u001f{normalized.ProductName}";
+    }
+
+    private static string FactorySubmissionGroupKey(FactorySubmissionLine line)
+    {
+        var normalized = NormalizeFactorySubmissionLine(line);
+        return $"{normalized.OrderDate}\u001f{normalized.DeliveryDate}\u001f{normalized.Location}";
+    }
+
     private static string NormalizeEditableDate(string? value)
     {
         var normalized = value?.Trim() ?? string.Empty;
@@ -1191,6 +1424,87 @@ public static class GiftBoxWorkbookExporter
                ?? throw new IOException("這份 Excel 正由另一個程式匯出，請稍後再試。");
     }
 
+    private static void EnsureFactoryDeltaWorksheetRegistered(ZipArchive archive)
+    {
+        XNamespace relationships = "http://schemas.openxmlformats.org/package/2006/relationships";
+        const string worksheetRelationshipType =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+        var relationshipsEntry = archive.GetEntry("xl/_rels/workbook.xml.rels")
+            ?? throw new InvalidDataException("Excel 缺少 Workbook Relationships。");
+        XDocument relationshipsDocument;
+        using (var input = relationshipsEntry.Open()) relationshipsDocument = XDocument.Load(input);
+        var relationshipElements = relationshipsDocument.Descendants(relationships + "Relationship").ToArray();
+        var factoryRelationship = relationshipElements.FirstOrDefault(element =>
+            ((string?)element.Attribute("Target"))?.TrimStart('/')
+            .Equals("worksheets/sheet4.xml", StringComparison.OrdinalIgnoreCase) == true);
+        var relationshipId = (string?)factoryRelationship?.Attribute("Id");
+        if (string.IsNullOrWhiteSpace(relationshipId))
+        {
+            var usedIds = relationshipElements
+                .Select(element => (string?)element.Attribute("Id"))
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToHashSet(StringComparer.Ordinal);
+            relationshipId = "rIdFactoryDelta";
+            for (var suffix = 1; usedIds.Contains(relationshipId); suffix++)
+            {
+                relationshipId = $"rIdFactoryDelta{suffix}";
+            }
+            relationshipsDocument.Root?.Add(new XElement(relationships + "Relationship",
+                new XAttribute("Id", relationshipId),
+                new XAttribute("Type", worksheetRelationshipType),
+                new XAttribute("Target", "worksheets/sheet4.xml")));
+            relationshipsEntry.Delete();
+            WriteDocumentEntry(archive, "xl/_rels/workbook.xml.rels", relationshipsDocument);
+        }
+
+        var workbookEntry = archive.GetEntry("xl/workbook.xml")
+            ?? throw new InvalidDataException("Excel 缺少活頁簿資訊。");
+        XDocument workbookDocument;
+        using (var input = workbookEntry.Open()) workbookDocument = XDocument.Load(input);
+        XNamespace spreadsheet = SpreadsheetNamespace;
+        XNamespace officeRelationships =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        var sheets = workbookDocument.Root?.Element(spreadsheet + "sheets")
+                     ?? throw new InvalidDataException("Excel 缺少工作表清單。");
+        var factorySheet = sheets.Elements(spreadsheet + "sheet").FirstOrDefault(sheet =>
+            ((string?)sheet.Attribute("name"))?.Equals(
+                FactoryDeltaSheetName, StringComparison.Ordinal) == true);
+        if (factorySheet is null)
+        {
+            var nextSheetId = sheets.Elements(spreadsheet + "sheet")
+                .Select(sheet => (uint?)sheet.Attribute("sheetId") ?? 0u)
+                .DefaultIfEmpty()
+                .Max() + 1u;
+            factorySheet = new XElement(spreadsheet + "sheet",
+                new XAttribute("name", FactoryDeltaSheetName),
+                new XAttribute("sheetId", nextSheetId),
+                new XAttribute(officeRelationships + "id", relationshipId));
+            sheets.Add(factorySheet);
+        }
+        else
+        {
+            factorySheet.SetAttributeValue(officeRelationships + "id", relationshipId);
+        }
+        workbookEntry.Delete();
+        WriteDocumentEntry(archive, "xl/workbook.xml", workbookDocument);
+
+        XNamespace contentTypes = "http://schemas.openxmlformats.org/package/2006/content-types";
+        var contentTypesEntry = archive.GetEntry("[Content_Types].xml")
+            ?? throw new InvalidDataException("Excel 缺少 Content Types。");
+        XDocument contentTypesDocument;
+        using (var input = contentTypesEntry.Open()) contentTypesDocument = XDocument.Load(input);
+        if (!contentTypesDocument.Descendants(contentTypes + "Override").Any(element =>
+                (string?)element.Attribute("PartName") == "/xl/worksheets/sheet4.xml"))
+        {
+            contentTypesDocument.Root?.Add(new XElement(contentTypes + "Override",
+                new XAttribute("PartName", "/xl/worksheets/sheet4.xml"),
+                new XAttribute("ContentType",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")));
+            contentTypesEntry.Delete();
+            WriteDocumentEntry(archive, "[Content_Types].xml", contentTypesDocument);
+        }
+    }
+
     private static void EnsureStyleParts(ZipArchive archive)
     {
         var existingStyles = archive.GetEntry("xl/styles.xml");
@@ -1252,6 +1566,48 @@ public static class GiftBoxWorkbookExporter
         WriteDocumentEntry(archive, "xl/workbook.xml", workbook);
     }
 
+    private static void RemoveCalculationChain(ZipArchive archive)
+    {
+        archive.GetEntry("xl/calcChain.xml")?.Delete();
+
+        XNamespace relationships = "http://schemas.openxmlformats.org/package/2006/relationships";
+        var relationshipsEntry = archive.GetEntry("xl/_rels/workbook.xml.rels")
+            ?? throw new InvalidDataException("Excel 缺少 Workbook Relationships。");
+        XDocument relationshipsDocument;
+        using (var input = relationshipsEntry.Open()) relationshipsDocument = XDocument.Load(input);
+        var calculationRelationships = relationshipsDocument
+            .Descendants(relationships + "Relationship")
+            .Where(element =>
+                ((string?)element.Attribute("Type"))?.EndsWith(
+                    "/calcChain", StringComparison.OrdinalIgnoreCase) == true ||
+                ((string?)element.Attribute("Target"))?.TrimStart('/')
+                    .Equals("calcChain.xml", StringComparison.OrdinalIgnoreCase) == true)
+            .ToArray();
+        if (calculationRelationships.Length > 0)
+        {
+            calculationRelationships.Remove();
+            relationshipsEntry.Delete();
+            WriteDocumentEntry(archive, "xl/_rels/workbook.xml.rels", relationshipsDocument);
+        }
+
+        XNamespace contentTypes = "http://schemas.openxmlformats.org/package/2006/content-types";
+        var contentTypesEntry = archive.GetEntry("[Content_Types].xml")
+            ?? throw new InvalidDataException("Excel 缺少 Content Types。");
+        XDocument contentTypesDocument;
+        using (var input = contentTypesEntry.Open()) contentTypesDocument = XDocument.Load(input);
+        var calculationOverrides = contentTypesDocument
+            .Descendants(contentTypes + "Override")
+            .Where(element => ((string?)element.Attribute("PartName"))?.Equals(
+                "/xl/calcChain.xml", StringComparison.OrdinalIgnoreCase) == true)
+            .ToArray();
+        if (calculationOverrides.Length > 0)
+        {
+            calculationOverrides.Remove();
+            contentTypesEntry.Delete();
+            WriteDocumentEntry(archive, "[Content_Types].xml", contentTypesDocument);
+        }
+    }
+
     private static void WriteDocumentEntry(ZipArchive archive, string path, XDocument document)
     {
         var entry = archive.CreateEntry(path, CompressionLevel.Optimal);
@@ -1307,6 +1663,13 @@ public static class GiftBoxWorkbookExporter
         string AggregateId,
         IReadOnlyList<string> SourceLineFingerprints);
 
+    private sealed record FactoryDeltaRow(
+        string OrderDate,
+        string DeliveryDate,
+        string Location,
+        IReadOnlyDictionary<string, decimal> PreviousQuantities,
+        IReadOnlyDictionary<string, decimal> Deltas);
+
     private sealed record ProductDescriptor(string Key, string Name, int Size);
 
     private sealed record SnapshotDateResolution(
@@ -1325,6 +1688,7 @@ public static class GiftBoxWorkbookExporter
           <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
           <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
           <Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+          <Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
           <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
         </Types>
         """;
@@ -1343,6 +1707,7 @@ public static class GiftBoxWorkbookExporter
             <sheet name="訂單明細" sheetId="1" r:id="rId1"/>
             <sheet name="日期待確認" sheetId="2" r:id="rId2"/>
             <sheet name="統計" sheetId="3" r:id="rId3"/>
+            <sheet name="本次補單" sheetId="4" r:id="rId4"/>
           </sheets>
           <calcPr calcId="191029" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>
         </workbook>
@@ -1354,7 +1719,8 @@ public static class GiftBoxWorkbookExporter
           <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
           <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
           <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
-          <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+          <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet4.xml"/>
+          <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
         </Relationships>
         """;
 

@@ -18,7 +18,10 @@ public static partial class OrderPreviewEnricher
     public static void Enrich(JsonObject order, JsonArray products)
     {
         ApplyChannelDisplayName(order);
-        ApplyDerivedShippingWindow(order, products);
+        ApplyDerivedShippingWindow(
+            order,
+            products,
+            WmsDepartmentStoreDatePolicy.IsDepartmentStoreChannel(GetString(order, "source")));
     }
 
     private static void ApplyChannelDisplayName(JsonObject order)
@@ -44,7 +47,10 @@ public static partial class OrderPreviewEnricher
         SetValue(order, "source", displayName);
     }
 
-    private static void ApplyDerivedShippingWindow(JsonObject order, JsonArray products)
+    private static void ApplyDerivedShippingWindow(
+        JsonObject order,
+        JsonArray products,
+        bool useDepartmentStoreDatePolicy)
     {
         foreach (var field in ApplicationOwnedShippingFields)
         {
@@ -55,18 +61,21 @@ public static partial class OrderPreviewEnricher
         var parentProducts = products.OfType<JsonObject>().ToArray();
         foreach (var product in parentProducts)
         {
-            ApplyDerivedShippingWindow(product, fallbackYear);
+            ApplyDerivedShippingWindow(product, fallbackYear, useDepartmentStoreDatePolicy);
         }
 
         MirrorConsistentProductShippingWindow(order, parentProducts);
         if (CanApplyArrivalDateFallback(parentProducts))
         {
-            ApplyArrivalDateFallback(order);
-            ApplyNoteDateFallback(order, fallbackYear);
+            ApplyArrivalDateFallback(order, useDepartmentStoreDatePolicy);
+            ApplyNoteDateFallback(order, fallbackYear, useDepartmentStoreDatePolicy);
         }
     }
 
-    private static void ApplyDerivedShippingWindow(JsonObject product, int? fallbackYear)
+    private static void ApplyDerivedShippingWindow(
+        JsonObject product,
+        int? fallbackYear,
+        bool useDepartmentStoreDatePolicy)
     {
         foreach (var field in ApplicationOwnedShippingFields)
         {
@@ -84,7 +93,7 @@ public static partial class OrderPreviewEnricher
             return;
         }
 
-        var specResult = ParseWindows(spec, year.Value, "product.spec");
+        var specResult = ParseWindows(spec, year.Value, "product.spec", useDepartmentStoreDatePolicy);
         if (specResult.Status != WindowParseStatus.NotFound)
         {
             candidates.AddRange(specResult.Windows);
@@ -93,7 +102,7 @@ public static partial class OrderPreviewEnricher
         }
         else
         {
-            var nameResult = ParseWindows(name, year.Value, "product.name");
+            var nameResult = ParseWindows(name, year.Value, "product.name", useDepartmentStoreDatePolicy);
             candidates.AddRange(nameResult.Windows);
             hasInvalidExplicitWindow = nameResult.Status == WindowParseStatus.Invalid;
             hasMultipleExplicitRanges = nameResult.HasMultipleExplicitRanges;
@@ -162,7 +171,8 @@ public static partial class OrderPreviewEnricher
     private static WindowParseResult ParseWindows(
         string value,
         int year,
-        string source)
+        string source,
+        bool useDepartmentStoreDatePolicy = false)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -237,7 +247,8 @@ public static partial class OrderPreviewEnricher
             windows.Add(new ShippingWindow(
                 start,
                 end,
-                ShippingLeadTimePolicy.Adjust(shippingDate),
+                ShippingLeadTimePolicy.Adjust(
+                    useDepartmentStoreDatePolicy ? shippingDate.AddDays(-1) : shippingDate),
                 source));
         }
 
@@ -258,7 +269,7 @@ public static partial class OrderPreviewEnricher
         return match.Success && int.TryParse(match.Value, out var year) ? year : null;
     }
 
-    private static void ApplyArrivalDateFallback(JsonObject order)
+    private static void ApplyArrivalDateFallback(JsonObject order, bool useDepartmentStoreDatePolicy)
     {
         if (!string.IsNullOrWhiteSpace(GetString(order, "derived_shipping_date")))
         {
@@ -277,12 +288,16 @@ public static partial class OrderPreviewEnricher
             return;
         }
 
-        SetValue(order, "derived_shipping_date", ShippingLeadTimePolicy.Adjust(originalDate).ToString("yyyy-MM-dd"));
+        var sourceDate = useDepartmentStoreDatePolicy ? originalDate.AddDays(-1) : originalDate;
+        SetValue(order, "derived_shipping_date", ShippingLeadTimePolicy.Adjust(sourceDate).ToString("yyyy-MM-dd"));
         SetValue(order, "shipping_date_source", "order.arrival_date");
         SetValue(order, "shipping_date_status", "derived");
     }
 
-    private static void ApplyNoteDateFallback(JsonObject order, int? fallbackYear)
+    private static void ApplyNoteDateFallback(
+        JsonObject order,
+        int? fallbackYear,
+        bool useDepartmentStoreDatePolicy)
     {
         if (!string.IsNullOrWhiteSpace(GetString(order, "derived_shipping_date")) ||
             fallbackYear is null)
@@ -290,7 +305,11 @@ public static partial class OrderPreviewEnricher
             return;
         }
 
-        var result = ParseWindows(GetString(order, "note") ?? string.Empty, fallbackYear.Value, "order.note");
+        var result = ParseWindows(
+            GetString(order, "note") ?? string.Empty,
+            fallbackYear.Value,
+            "order.note",
+            useDepartmentStoreDatePolicy);
         var distinct = result.Windows
             .DistinctBy(candidate => (candidate.Start, candidate.End, candidate.ShippingDate))
             .ToArray();

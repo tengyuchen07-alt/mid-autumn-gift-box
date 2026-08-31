@@ -7,7 +7,8 @@ public sealed record ManualOverrideState(
     string? LastWorkbookPath,
     IReadOnlyList<WorkbookEditableRow> LastExportedRows,
     IReadOnlyList<OrderRowManualOverride> Overrides,
-    IReadOnlyList<WorkbookRowAutomaticReset>? PendingAutomaticResets = null)
+    IReadOnlyList<WorkbookRowAutomaticReset>? PendingAutomaticResets = null,
+    FactorySubmissionSnapshot? LastFactorySubmission = null)
 {
     public static ManualOverrideState Empty { get; } = new(null, [], []);
 }
@@ -60,7 +61,8 @@ public sealed class ManualOverrideStore
                 : Path.GetFullPath(state.LastWorkbookPath),
             LastExportedRows = state.LastExportedRows.ToArray(),
             Overrides = state.Overrides.ToArray(),
-            PendingAutomaticResets = state.PendingAutomaticResets?.ToArray() ?? []
+            PendingAutomaticResets = state.PendingAutomaticResets?.ToArray() ?? [],
+            LastFactorySubmission = NormalizeFactorySubmission(state.LastFactorySubmission)
         };
 
         await _fileLock.WaitAsync(cancellationToken);
@@ -90,5 +92,22 @@ public sealed class ManualOverrideStore
         {
             _fileLock.Release();
         }
+    }
+
+    private static FactorySubmissionSnapshot? NormalizeFactorySubmission(
+        FactorySubmissionSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        return snapshot with
+        {
+            WorkbookPath = string.IsNullOrWhiteSpace(snapshot.WorkbookPath)
+                ? string.Empty
+                : Path.GetFullPath(snapshot.WorkbookPath),
+            Lines = (snapshot.Lines ?? []).ToArray()
+        };
     }
 }

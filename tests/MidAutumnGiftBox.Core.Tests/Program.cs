@@ -10,7 +10,7 @@ using MidAutumnGiftBox.Core;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
-    ("Workbook consolidates all products into detail, pending review, and native-formula statistics", WorkbookUsesThreeConsolidatedWorksheetsAndNativeFormulas),
+    ("Workbook consolidates orders into detail, review, statistics, and factory delta sheets", WorkbookUsesFourConsolidatedWorksheetsAndNativeFormulas),
     ("Excel 2013 statistics remain structurally valid at 421 detail rows", WorkbookStatisticsSupports421DetailRows),
     ("Workbook output preserves past, current, and future order dates", WorkbookOutputPreservesAllOrderDates),
     ("Excel location uses the channel mapping only when the existing manual location is blank", WorkbookLocationUsesChannelMappingWithoutOverwritingManualValue),
@@ -21,6 +21,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("訂單預覽依成立日範圍取得蛋黃酥資料且不以指定到貨日排除", PendingOrderPreviewUsesOrderDateRange),
     ("WMS 商品以 item_no 優先保留且名稱條件仍供異常預覽", WmsProductFilterUsesItemNumberAndKeepsReviewFallbacks),
     ("睿驛訂單以 source_key 顯示通路並從商品 spec 推導出貨星期一", ReyiChannelAndShippingWindowUseVerifiedFields),
+    ("暢流百貨預覽與正式 Excel 使用相同提前日期", WmsDepartmentStorePreviewUsesOneDayEarlierDeliveryPolicy),
     ("WMS 訂單備註可在既有日期空白時推導日期並完整進入 Excel", WmsOrderNoteFallbackPersistsAndExports),
     ("商品與 API 日期優先於備註且備註衝突不猜日期", ExistingDatesPrecedeOrderNoteAndNoteConflictsNeedReview),
     ("模糊或衝突商品日期不會產生指定出貨日", ShippingDerivationRejectsFuzzyAndConflictingText),
@@ -40,11 +41,19 @@ var tests = new (string Name, Func<Task> Run)[]
     ("同步查詢日期固定使用台北時區", SyncQueryDateUsesTaipeiTimeZone),
     ("來源訂單快照重跑會更新商品且不影響另一來源", OrderSnapshotReplacesOneSourceWithoutDuplicates),
     ("最新完整快照可直接產生正式訂單而不依賴 Ledger", CurrentSnapshotProjectsCurrentOrdersWithoutLedger),
+    ("暢流百貨通路會提前一天後回推星期二四且其他來源不變", WmsDepartmentStoreChannelsUseOneDayEarlierDeliveryPolicy),
     ("WMS 無日期單入會繼承同訂單最早禮盒日期且孤立單入不匯出", WmsDependentSinglesUseEarliestGiftDate),
     ("兩網站完整快照只有整批有效時才一起取代", FullSnapshotReplacementIsAtomicAcrossSources),
+    ("重新載入只建立可跨重啟保留的暫存快照且正式匯出後才提交", StagedSnapshotCommitsOnlyAfterFormalExport),
+    ("沒有新 WMS 載入的正式匯出仍建立可復原交易", FormalExportWithoutNewWmsCreatesRecoverableTransaction),
+    ("測試匯出只建立新檔且不改變正式人工狀態", TestExportCreatesNewWorkbookWithoutChangingFormalState),
+    ("正式送廠快照以人工後日期計算正負補單且零差異不列出", FactorySubmissionDeltaUsesEffectiveDatesAndOmitsZeroRows),
+    ("既有三工作表正式檔可直接升級本次補單工作表", LegacyThreeSheetWorkbookUpgradesFactoryDelta),
+    ("重寫本次補單時會移除 Excel 舊計算鏈", WorkbookRewriteRemovesStaleCalculationChain),
     ("同 SKU 不同日期明細重排後仍維持相同識別值", SameSkuDifferentDateLinesKeepIdentityWhenReordered),
     ("人工修改四欄含空白都永久優先且可整筆清除", ManualOverridesPreserveBlanksAndClearByDetailRow),
     ("人工覆寫檔保存最近 Excel 路徑與匯出列基準", ManualOverrideStatePersistsWorkbookPathAndRows),
+    ("舊 Excel 無法讀取時可保留人工覆寫並另存新版", UnreadablePreviousWorkbookCanContinueAsNew),
     ("正式 Excel 可讀回四個人工欄位與明細識別值", FormalWorkbookReadsBackEditableRows),
     ("清除覆寫後同路徑匯出會恢復自動地點與確認", ClearedOverrideRestoresAutomaticFieldsInExistingWorkbook),
     ("訂單快照遇到重複唯一鍵會拒絕整批資料", OrderSnapshotRejectsDuplicateUniqueKeys),
@@ -72,7 +81,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("日期待確認只回寫指定到貨日並自動移入訂單明細", PendingDateWorkbookWritesBackSpecifiedDate),
     ("Excel 同時顯示原定到貨日、下單日並保留人工地點", WorkbookShowsOriginalAndOrderDatesAndPreservesLocation),
     ("Excel 人工欄位含公式時拒絕覆寫原檔", WorkbookRejectsManualFieldFormulaWithoutOverwrite),
-    ("Excel 三張工作表使用標楷體且不建立自動篩選", WorkbookUsesDfkaiAndHasNoAutoFilters),
+    ("Excel 四張工作表使用標楷體且不建立自動篩選", WorkbookUsesDfkaiAndHasNoAutoFilters),
     ("更新舊版 Excel 會補標楷體並移除既有篩選", LegacyWorkbookUpdateAddsDfkaiAndRemovesFilters),
     ("ERP 與手打單 Excel 依欄名載入並產生可匯出資料", SpreadsheetSourcesMapColumnsAndTargetSkus),
     ("自動載入會從啟動資料夾解析三個固定 Excel 檔名", StartupSpreadsheetInputsResolveFixedFileNames),
@@ -81,7 +90,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("手打單兩種單入品名進入日期待確認且不互相合併", ManualSingleItemsUseSeparateWorksheet),
     ("舊異動名稱依蛋黃酥入數分流且不誤用芝麻粉倍數", GiftBoxSizeUsesEggYolkCountNotOtherMultipliers),
     ("同一來源的本機同步鎖同時間只能由一個程序取得", SourceSyncLockIsExclusive),
-    ("清除歷史會先備份三個資料檔且可在重抓失敗時復原", LocalHistoryResetIsRecoverable),
+    ("清除歷史會備份正式與暫存快照且可在重抓失敗時復原", LocalHistoryResetIsRecoverable),
     ("手打單會保存稽核與登記狀態並安全加入 Excel 資料", ManualOrdersPersistAuditAndExportSafely),
     ("最近同步失敗不會把最後提交快照標成失敗資料", FailedSyncKeepsCommittedPreviewValid),
     ("快照投影遇到孤立子商品會拒絕顯示", SnapshotPreviewRejectsOrphanItems),
@@ -418,6 +427,38 @@ static async Task ReyiChannelAndShippingWindowUseVerifiedFields()
     Contains("8/22-8/28當週出貨", row["products"] ?? string.Empty, "Product spec should remain visible.");
     Contains("蝦皮賣場", result.SafeJson, "Safe JSON should contain the channel display name.");
     Contains("2026-08-13", result.SafeJson, "Safe JSON should contain the adjusted shipping date.");
+}
+
+static Task WmsDepartmentStorePreviewUsesOneDayEarlierDeliveryPolicy()
+{
+    JsonObject Order(string channel) => new()
+    {
+        ["order_date"] = "2026/08/19 09:00:00",
+        ["arrival_date"] = "2026/08/20",
+        ["source"] = channel
+    };
+    JsonArray Products() =>
+    [
+        new JsonObject
+        {
+            ["sku"] = "4710964232411",
+            ["item_no"] = "1902248",
+            ["name"] = "芝麻蛋黃酥6入",
+            ["qty"] = 1
+        }
+    ];
+
+    var departmentStore = Order("正-新光A4");
+    OrderPreviewEnricher.Enrich(departmentStore, Products());
+    Equal("2026-08-11", departmentStore["derived_shipping_date"]?.GetValue<string>(),
+        "The WMS preview must subtract one day before aligning a department-store order date.");
+
+    var online = Order("PCHOME");
+    OrderPreviewEnricher.Enrich(online, Products());
+    Equal("2026-08-13", online["derived_shipping_date"]?.GetValue<string>(),
+        "A non-department WMS preview must keep the existing date policy.");
+
+    return Task.CompletedTask;
 }
 
 static async Task WmsOrderNoteFallbackPersistsAndExports()
@@ -2937,6 +2978,103 @@ static Task CurrentSnapshotProjectsCurrentOrdersWithoutLedger()
     return Task.CompletedTask;
 }
 
+static Task WmsDepartmentStoreChannelsUseOneDayEarlierDeliveryPolicy()
+{
+    string[] departmentStoreChannels =
+    [
+        "正-新光A4",
+        "正-台中高鐵",
+        "臨新竹大全聯",
+        "正-夢時代",
+        "正-京站",
+        "臨新莊宏匯",
+        "臨桃園大江",
+        "臨大葉高島屋",
+        "臨新光三越台南新天地"
+    ];
+    var synchronizedAt = new DateTimeOffset(2026, 8, 21, 9, 0, 0, TimeSpan.FromHours(8));
+
+    OrderLineSnapshot Line(
+        string sourceCode,
+        string orderNo,
+        string channel,
+        string shippingDateStatus = "resolved") =>
+        new(
+            sourceCode, orderNo, $"parent:{orderNo}", "parent", null, "pos", channel,
+            "2026/08/19 09:00:00", "2026/08/20", null, "4710964232411", "1902248",
+            "芝麻蛋黃酥6入", null, 1m, 0m, "F", synchronizedAt,
+            ChannelName: channel, ShippingDateStatus: shippingDateStatus, StatusName: "待處理");
+
+    var snapshots = departmentStoreChannels
+        .Select((channel, index) => Line("site2", $"DEPT-{index + 1:00}", channel))
+        .Append(Line("site2", "ONLINE", "PCHOME"))
+        .Append(Line("erp", "ERP-CONTROL", "正-新光A4"))
+        .Append(Line("site2", "DEPT-CONFLICT", "正-新光A4", "conflict"))
+        .ToArray();
+
+    var projected = CurrentSnapshotOrderProjector.Project(
+        snapshots,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["site2"] = "Flavor",
+            ["erp"] = "ERP"
+        },
+        synchronizedAt.AddMinutes(1));
+
+    foreach (var (channel, index) in departmentStoreChannels.Select((channel, index) => (channel, index)))
+    {
+        var orderNo = $"DEPT-{index + 1:00}";
+        var entry = projected.Single(item => item.ExternalOrderNo == orderNo);
+        Equal("2026-08-18", entry.OriginalDeliveryDate,
+            $"{channel} must subtract one day before aligning its delivery date to Tuesday or Thursday.");
+        Equal("2026-08-11", entry.DeliveryDate,
+            $"{channel} must keep the order date exactly seven days before its adjusted delivery date.");
+    }
+
+    var online = projected.Single(item => item.ExternalOrderNo == "ONLINE");
+    Equal("2026-08-20", online.OriginalDeliveryDate,
+        "A non-department WMS channel must keep the existing delivery-date policy.");
+    Equal("2026-08-13", online.DeliveryDate,
+        "A non-department WMS channel must keep the existing order-date policy.");
+
+    var erp = projected.Single(item => item.ExternalOrderNo == "ERP-CONTROL");
+    Equal("2026-08-20", erp.OriginalDeliveryDate,
+        "ERP must not inherit the WMS department-store date policy from a matching channel name.");
+    Equal("2026-08-13", erp.DeliveryDate,
+        "ERP order dates must remain unchanged.");
+
+    var conflict = projected.Single(item => item.ExternalOrderNo == "DEPT-CONFLICT");
+    Equal(null, conflict.OriginalDeliveryDate,
+        "A conflicting department-store date must remain unresolved instead of being guessed.");
+    Equal(null, conflict.DeliveryDate,
+        "A conflicting department-store order date must remain unresolved.");
+
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-department-policy-{Guid.NewGuid():N}.xlsx");
+    try
+    {
+        GiftBoxWorkbookExporter.Export(path, projected, snapshots);
+        var workbookRows = GiftBoxWorkbookExporter.ReadEditableRows(path);
+        foreach (var (channel, index) in departmentStoreChannels.Select((channel, index) => (channel, index)))
+        {
+            var orderNo = $"DEPT-{index + 1:00}";
+            var row = workbookRows.Single(item => item.ExternalOrderNo == orderNo && item.Sheet == "detail");
+            Equal("2026-08-18", row.OriginalDeliveryDate,
+                $"Formal Excel must show the adjusted department-store delivery date for {channel}.");
+            Equal("2026-08-11", row.OrderDate,
+                $"Formal Excel must show the adjusted department-store order date for {channel}.");
+        }
+
+        Equal("pending", workbookRows.Single(item => item.ExternalOrderNo == "DEPT-CONFLICT").Sheet,
+            "An unresolved department-store date must enter the pending-date worksheet.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
 static Task WmsDependentSinglesUseEarliestGiftDate()
 {
     var synchronizedAt = new DateTimeOffset(2026, 8, 12, 9, 0, 0, TimeSpan.FromHours(8));
@@ -3123,6 +3261,507 @@ static async Task FullSnapshotReplacementIsAtomicAcrossSources()
     }
 }
 
+static async Task StagedSnapshotCommitsOnlyAfterFormalExport()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-staged-snapshot-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var committedStore = new OrderSnapshotStore(Path.Combine(directory, "order-snapshot.json"));
+    var stagedPath = Path.Combine(directory, "order-snapshot.staged.json");
+    var synchronizedAt = new DateTimeOffset(2026, 8, 19, 9, 0, 0, TimeSpan.FromHours(8));
+
+    OrderLineSnapshot Row(string orderNo, decimal quantity) => new(
+        "site1", orderNo, $"parent:{orderNo}", "parent", null, "channel", "shop",
+        "2026/08/19 08:00:00", "2026/08/27", "2026-08-25", "4710964232411", null,
+        "gift box", null, quantity, 0m, "F", synchronizedAt,
+        ChannelName: "channel", ShippingDateStatus: "resolved", StatusName: "pending");
+
+    try
+    {
+        await committedStore.ReplaceAllAsync([Row("COMMITTED", 1m)]);
+        var stagedStore = new StagedOrderSnapshotStore(stagedPath);
+        var transaction = await stagedStore.StageAsync([Row("STAGED", 2m)], synchronizedAt);
+
+        Equal("COMMITTED", (await committedStore.GetAllAsync()).Single().ExternalOrderNo,
+            "Staging a complete reload must not replace the committed snapshot.");
+        var preview = await stagedStore.GetPreferredAsync(committedStore);
+        True(preview.IsStaged, "Preview must identify that it is using uncommitted staged data.");
+        Equal("STAGED", preview.Lines.Single().ExternalOrderNo,
+            "Preview must prefer the staged snapshot over committed data.");
+
+        var reopenedStore = new StagedOrderSnapshotStore(stagedPath);
+        var reopened = await reopenedStore.GetPreferredAsync(committedStore);
+        Equal(transaction.TransactionId, reopened.TransactionId,
+            "A staged reload must survive application restart with the same transaction identity.");
+
+        var pendingManualState = new ManualOverrideState(
+            "C:\\formal.xlsx",
+            [],
+            [],
+            [new WorkbookRowAutomaticReset("row", ["fingerprint"])],
+            new FactorySubmissionSnapshot(
+                synchronizedAt,
+                "C:\\formal.xlsx",
+                [new FactorySubmissionLine(
+                    "2026-08-20", "2026-08-27", "彰廠", "6入鐵盒2026年鐵盒(黑金袋)", 2m)]));
+        var preparedWorkbookPath = Path.Combine(directory, "prepared.xlsx");
+        await File.WriteAllTextAsync(preparedWorkbookPath, "prepared workbook sentinel");
+        await reopenedStore.MarkExportPreparedAsync(
+            transaction.TransactionId,
+            "C:\\formal.xlsx",
+            preparedWorkbookPath,
+            pendingManualState);
+        var prepared = await new StagedOrderSnapshotStore(stagedPath).GetAsync();
+        Equal(StagedSnapshotStates.ExportPrepared, prepared?.State,
+            "A formal export must be recoverable before the prepared workbook replaces its target.");
+        Equal(Path.GetFullPath(preparedWorkbookPath), prepared?.PreparedWorkbookPath,
+            "The transaction marker must retain the prepared workbook path for startup recovery.");
+        True(!string.IsNullOrWhiteSpace(prepared?.PreparedWorkbookSha256),
+            "The transaction marker must retain the prepared workbook content identity.");
+        Equal(2m, prepared?.PendingManualState?.LastFactorySubmission?.Lines.Single().Quantity,
+            "The prepared transaction must retain the new factory baseline for crash recovery.");
+        var recoveryTargetPath = Path.Combine(directory, "formal-target.xlsx");
+        await File.WriteAllTextAsync(recoveryTargetPath, "older workbook sentinel");
+        True(!StagedOrderSnapshotStore.MatchesPreparedWorkbook(prepared!, recoveryTargetPath),
+            "Startup recovery must not mistake an older target workbook for this transaction output.");
+        File.Copy(preparedWorkbookPath, recoveryTargetPath, overwrite: true);
+        True(StagedOrderSnapshotStore.MatchesPreparedWorkbook(prepared!, recoveryTargetPath),
+            "Startup recovery must recognize the exact workbook prepared by this transaction.");
+        var reloadRejected = false;
+        try
+        {
+            await reopenedStore.StageAsync([Row("NEWER", 3m)], synchronizedAt.AddMinutes(1));
+        }
+        catch (InvalidOperationException)
+        {
+            reloadRejected = true;
+        }
+        True(reloadRejected,
+            "A prepared formal export must not be overwritten by another complete reload.");
+        await reopenedStore.MarkExcelCommittedAsync(
+            transaction.TransactionId,
+            "C:\\formal.xlsx",
+            pendingManualState);
+        var interrupted = await new StagedOrderSnapshotStore(stagedPath).GetAsync();
+        Equal("C:\\formal.xlsx", interrupted?.PendingManualState?.LastWorkbookPath,
+            "An interrupted formal export must retain the manual state needed for startup recovery.");
+        Equal(1, interrupted?.PendingManualState?.PendingAutomaticResets?.Count ?? 0,
+            "Startup recovery must retain every pending manual-state field until it is persisted.");
+        Equal(2m, interrupted?.PendingManualState?.LastFactorySubmission?.Lines.Single().Quantity,
+            "Startup recovery must not lose the factory submission baseline after Excel commit.");
+        await reopenedStore.CommitAsync(transaction.TransactionId, committedStore);
+
+        Equal("STAGED", (await committedStore.GetAllAsync()).Single().ExternalOrderNo,
+            "Only formal commit may promote staged data to the committed snapshot.");
+        var afterCommit = await reopenedStore.GetAsync();
+        Equal(null, afterCommit, "Committed staged data must be removed after a successful promotion.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task FormalExportWithoutNewWmsCreatesRecoverableTransaction()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-formal-transaction-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var committedStore = new OrderSnapshotStore(Path.Combine(directory, "order-snapshot.json"));
+    var stagedStore = new StagedOrderSnapshotStore(Path.Combine(directory, "order-snapshot.staged.json"));
+    var synchronizedAt = new DateTimeOffset(2026, 8, 20, 17, 0, 0, TimeSpan.FromHours(8));
+    var committedLine = new OrderLineSnapshot(
+        "site1", "UNCHANGED-WMS", "parent:unchanged", "parent", null, "channel", "shop",
+        "2026/08/19", "2026/08/27", "2026-08-20", "1902248", "1902248",
+        "六入禮盒", null, 2m, 2m, "F", synchronizedAt,
+        ChannelName: "PCHOME", ShippingDateStatus: "resolved", StatusName: "待處理");
+
+    try
+    {
+        await committedStore.ReplaceAllAsync([committedLine]);
+        var committedSelection = await stagedStore.GetPreferredAsync(committedStore);
+        True(!committedSelection.IsStaged,
+            "The regression must begin without a newly loaded WMS snapshot.");
+
+        var formalSelection = await stagedStore.EnsureForFormalExportAsync(
+            committedSelection,
+            synchronizedAt.AddMinutes(1));
+        True(formalSelection.IsStaged && !string.IsNullOrWhiteSpace(formalSelection.TransactionId),
+            "Every formal export must receive a recoverable transaction identity.");
+        Equal("UNCHANGED-WMS", formalSelection.Lines.Single().ExternalOrderNo,
+            "Creating a formal transaction must preserve the committed WMS snapshot content.");
+
+        var pendingState = new ManualOverrideState(
+            "C:\\formal.xlsx", [], [], [],
+            new FactorySubmissionSnapshot(
+                synchronizedAt,
+                "C:\\formal.xlsx",
+                [new FactorySubmissionLine(
+                    "2026-08-20", "2026-08-27", "彰廠", "6入鐵盒2026年鐵盒(黑金袋)", 2m)]));
+        var preparedPath = Path.Combine(directory, "prepared.xlsx");
+        await File.WriteAllTextAsync(preparedPath, "prepared workbook");
+        await stagedStore.MarkExportPreparedAsync(
+            formalSelection.TransactionId!,
+            "C:\\formal.xlsx",
+            preparedPath,
+            pendingState);
+        var recoverable = await stagedStore.GetAsync();
+        Equal(2m, recoverable?.PendingManualState?.LastFactorySubmission?.Lines.Single().Quantity,
+            "A formal export without new WMS data must still preserve its factory baseline for recovery.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task TestExportCreatesNewWorkbookWithoutChangingFormalState()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-test-export-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var outputPath = Path.Combine(directory, "test-output.xlsx");
+    var existingPath = Path.Combine(directory, "must-not-overwrite.xlsx");
+    var incompatibleFormalPath = Path.Combine(directory, "incompatible-formal.xlsx");
+    var manualStatePath = Path.Combine(directory, "manual-overrides.json");
+    var existingBytes = Encoding.UTF8.GetBytes("existing formal content");
+    File.WriteAllBytes(existingPath, existingBytes);
+    File.WriteAllText(incompatibleFormalPath, "not a workbook created by this application");
+    var observedAt = new DateTimeOffset(2026, 8, 19, 9, 0, 0, TimeSpan.FromHours(8));
+    var entry = new OrderChangeEntry(
+        "TEST-ENTRY", observedAt, "site1", "網站1", "ORDER-TEST", "parent:test", "PCHOME",
+        "2026/08/19 08:00:00", "2026-08-20", "1902226", "蛋黃酥3入禮盒",
+        0m, 1m, 1m, "新增", "F", "待處理", false,
+        OriginalDeliveryDate: "2026-08-25", GiftBoxSize: 3);
+    var fingerprint = ManualOverrideWorkflow.BuildEntryFingerprint(entry);
+    var manualOverride = new OrderRowManualOverride(
+        ManualOverrideWorkflow.BuildRowKey([fingerprint]),
+        [fingerprint],
+        ManualFieldOverride.None,
+        ManualFieldOverride.None,
+        new ManualFieldOverride(true, "測試人工地點"),
+        ManualFieldOverride.None,
+        observedAt);
+    var state = new ManualOverrideState(
+        incompatibleFormalPath,
+        [],
+        [manualOverride],
+        [new WorkbookRowAutomaticReset("row", ["fingerprint"])],
+        new FactorySubmissionSnapshot(
+            observedAt.AddDays(-2),
+            incompatibleFormalPath,
+            [new FactorySubmissionLine(
+                "2026-08-20", "2026-08-25", "測試人工地點", "3入禮盒紙盒(黑金袋)", 4m)]));
+
+    try
+    {
+        var manualStore = new ManualOverrideStore(manualStatePath);
+        await manualStore.SaveAsync(state);
+        var stateBytesBeforeTestExport = File.ReadAllBytes(manualStatePath);
+        await TestWorkbookExportWorkflow.ExportNewAsync(outputPath, [entry], manualStore);
+        True(File.Exists(outputPath), "A test export must create a new workbook.");
+        Equal("測試人工地點", GiftBoxWorkbookExporter.ReadEditableRows(outputPath).Single().Location,
+            "A test export must apply existing manual overrides to its workbook copy.");
+        Equal(Path.GetFullPath(incompatibleFormalPath), state.LastWorkbookPath,
+            "A test export must not change the tracked formal workbook path.");
+        Equal(1, state.PendingAutomaticResets!.Count,
+            "A test export must not clear pending formal reset state.");
+        True(File.ReadAllBytes(manualStatePath).SequenceEqual(stateBytesBeforeTestExport),
+            "A test export must not update the persisted factory submission baseline.");
+        using (var archive = ZipFile.OpenRead(outputPath))
+        {
+            XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            using var deltaInput = archive.GetEntry("xl/worksheets/sheet4.xml")!.Open();
+            var delta = XDocument.Load(deltaInput);
+            var cached = delta.Descendants(spreadsheet + "c")
+                .Where(cell => cell.Element(spreadsheet + "f") is not null)
+                .Select(cell => decimal.Parse(
+                    cell.Element(spreadsheet + "v")!.Value,
+                    CultureInfo.InvariantCulture))
+                .ToArray();
+            True(cached.Contains(-3m),
+                "A test export must preview the delta against the persisted formal factory baseline.");
+        }
+
+        var rejected = false;
+        try
+        {
+            TestWorkbookExportWorkflow.ExportNew(existingPath, [entry], state);
+        }
+        catch (InvalidOperationException)
+        {
+            rejected = true;
+        }
+
+        True(rejected, "A test export must reject an existing target instead of overwriting it.");
+        True(File.ReadAllBytes(existingPath).SequenceEqual(existingBytes),
+            "A rejected test export must preserve the existing file byte for byte.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+
+}
+
+static Task FactorySubmissionDeltaUsesEffectiveDatesAndOmitsZeroRows()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"mid-autumn-factory-delta-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var firstPath = Path.Combine(directory, "first.xlsx");
+    var unchangedPath = Path.Combine(directory, "unchanged.xlsx");
+    var observedAt = new DateTimeOffset(2026, 8, 20, 17, 0, 0, TimeSpan.FromHours(8));
+
+    OrderChangeEntry Entry(
+        string id,
+        string sku,
+        decimal quantity,
+        string specifiedDate,
+        string orderDate) => new(
+        id, observedAt, "erp", "ERP", $"ORDER-{id}", $"line:{id}", "正-新光A4",
+        "2026/08/19 08:00:00", orderDate, sku, "來源品名",
+        0m, quantity, quantity, "新增", "F", "待處理", false,
+        OriginalDeliveryDate: specifiedDate,
+        HasManualOriginalDeliveryDate: true,
+        HasManualOrderDate: true);
+
+    var effectiveEntries = new[]
+    {
+        Entry("MOVED-THREE", "1902226", 10m, "2026-09-03", "2026-08-27"),
+        Entry("MORE-SIX", "1902248", 5m, "2026-08-27", "2026-08-20")
+    };
+    var previous = new FactorySubmissionSnapshot(
+        new DateTimeOffset(2026, 8, 18, 17, 0, 0, TimeSpan.FromHours(8)),
+        "C:\\previous.xlsx",
+        [
+            new FactorySubmissionLine(
+                "2026-08-20", "2026-08-27", "彰廠", "3入禮盒紙盒(黑金袋)", 10m),
+            new FactorySubmissionLine(
+                "2026-08-20", "2026-08-27", "彰廠", "6入鐵盒2026年鐵盒(黑金袋)", 2m)
+        ]);
+
+    try
+    {
+        GiftBoxWorkbookExporter.Export(firstPath, effectiveEntries, previous);
+        using (var archive = ZipFile.OpenRead(firstPath))
+        {
+            XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            using var workbookInput = archive.GetEntry("xl/workbook.xml")!.Open();
+            var workbook = XDocument.Load(workbookInput);
+            var names = workbook.Descendants(ns + "sheet")
+                .Select(sheet => (string?)sheet.Attribute("name"))
+                .ToArray();
+            True(names.SequenceEqual(["訂單明細", "日期待確認", "統計", "本次補單"]),
+                "A formal workbook must append the factory delta worksheet after the existing three sheets.");
+
+            using var deltaInput = archive.GetEntry("xl/worksheets/sheet4.xml")!.Open();
+            var delta = XDocument.Load(deltaInput);
+            var rows = delta.Descendants(ns + "row").ToArray();
+            Equal(3, rows.Length,
+                "A moved date must produce one negative old-key row and one positive new-key row.");
+            var cachedValues = delta.Descendants(ns + "c")
+                .Where(cell => cell.Element(ns + "f") is not null)
+                .Select(cell => decimal.Parse(cell.Element(ns + "v")!.Value, CultureInfo.InvariantCulture))
+                .ToArray();
+            True(cachedValues.Contains(-10m), "The previous delivery date must show -10 after the move.");
+            True(cachedValues.Contains(10m), "The new delivery date must show +10 after the move.");
+            True(cachedValues.Contains(3m), "The increased six-piece quantity must show +3.");
+            True(delta.Descendants(ns + "f").All(formula =>
+                    formula.Value.Contains("SUMIFS(", StringComparison.OrdinalIgnoreCase)),
+                "Every factory delta quantity must be an Excel 2013 SUMIFS subtraction formula.");
+        }
+
+        var current = GiftBoxWorkbookExporter.CreateFactorySubmissionSnapshot(
+            effectiveEntries,
+            observedAt,
+            firstPath);
+        GiftBoxWorkbookExporter.Export(unchangedPath, effectiveEntries, current);
+        using var unchangedArchive = ZipFile.OpenRead(unchangedPath);
+        using var unchangedInput = unchangedArchive.GetEntry("xl/worksheets/sheet4.xml")!.Open();
+        var unchanged = XDocument.Load(unchangedInput);
+        XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        Equal(1, unchanged.Descendants(spreadsheet + "row").Count(),
+            "A zero-difference submission must contain only the header row.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task LegacyThreeSheetWorkbookUpgradesFactoryDelta()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-legacy-three-sheet-{Guid.NewGuid():N}.xlsx");
+    var observedAt = new DateTimeOffset(2026, 8, 20, 17, 0, 0, TimeSpan.FromHours(8));
+    var entry = new OrderChangeEntry(
+        "LEGACY-UPGRADE", observedAt, "erp", "ERP", "ORDER-UPGRADE", "line:upgrade", "PCHOME",
+        "2026/08/19", "2026-08-20", "1902248", "來源品名",
+        0m, 2m, 2m, "新增", "F", "待處理", false,
+        OriginalDeliveryDate: "2026-08-27");
+
+    try
+    {
+        GiftBoxWorkbookExporter.Export(path, [entry]);
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            XNamespace spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            XNamespace packageRelationships =
+                "http://schemas.openxmlformats.org/package/2006/relationships";
+            XNamespace contentTypes =
+                "http://schemas.openxmlformats.org/package/2006/content-types";
+
+            var workbook = Load("xl/workbook.xml");
+            workbook.Descendants(spreadsheet + "sheet")
+                .Single(sheet => (string?)sheet.Attribute("name") == "本次補單")
+                .Remove();
+            Replace("xl/workbook.xml", workbook);
+
+            var relationships = Load("xl/_rels/workbook.xml.rels");
+            relationships.Descendants(packageRelationships + "Relationship")
+                .Single(element => ((string?)element.Attribute("Target")) == "worksheets/sheet4.xml")
+                .Remove();
+            relationships.Descendants(packageRelationships + "Relationship")
+                .Single(element => ((string?)element.Attribute("Target")) == "styles.xml")
+                .SetAttributeValue("Id", "rId4");
+            Replace("xl/_rels/workbook.xml.rels", relationships);
+
+            var types = Load("[Content_Types].xml");
+            types.Descendants(contentTypes + "Override")
+                .Single(element => ((string?)element.Attribute("PartName")) == "/xl/worksheets/sheet4.xml")
+                .Remove();
+            Replace("[Content_Types].xml", types);
+            archive.GetEntry("xl/worksheets/sheet4.xml")!.Delete();
+
+            XDocument Load(string archivePath)
+            {
+                using var input = archive.GetEntry(archivePath)!.Open();
+                return XDocument.Load(input);
+            }
+
+            void Replace(string archivePath, XDocument document)
+            {
+                archive.GetEntry(archivePath)!.Delete();
+                using var output = archive.CreateEntry(archivePath).Open();
+                document.Save(output);
+            }
+        }
+
+        Equal(1, GiftBoxWorkbookExporter.ReadEditableRows(path).Count,
+            "The previous three-sheet formal workbook must remain readable before upgrade.");
+        GiftBoxWorkbookExporter.Export(path, [entry]);
+        using var upgradedArchive = ZipFile.OpenRead(path);
+        XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        using var workbookInput = upgradedArchive.GetEntry("xl/workbook.xml")!.Open();
+        var upgradedWorkbook = XDocument.Load(workbookInput);
+        True(upgradedWorkbook.Descendants(ns + "sheet")
+                .Select(sheet => (string?)sheet.Attribute("name"))
+                .SequenceEqual(["訂單明細", "日期待確認", "統計", "本次補單"]),
+            "The previous three-sheet workbook must be upgraded in place without rebuilding it.");
+        True(upgradedArchive.GetEntry("xl/worksheets/sheet4.xml") is not null,
+            "The upgraded workbook must contain the factory delta worksheet part.");
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task WorkbookRewriteRemovesStaleCalculationChain()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-stale-calc-chain-{Guid.NewGuid():N}.xlsx");
+    var observedAt = new DateTimeOffset(2026, 8, 19, 17, 0, 0, TimeSpan.FromHours(8));
+    var entry = new OrderChangeEntry(
+        "CALC-CHAIN", observedAt, "erp", "ERP", "ORDER-CALC", "line:calc", "PCHOME",
+        "2026/08/19", "2026-08-20", "1902248", "來源品名",
+        0m, 5m, 5m, "新增", "F", "待處理", false,
+        OriginalDeliveryDate: "2026-08-27");
+
+    try
+    {
+        GiftBoxWorkbookExporter.Export(path, [entry]);
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            XNamespace relationships =
+                "http://schemas.openxmlformats.org/package/2006/relationships";
+            XNamespace contentTypes =
+                "http://schemas.openxmlformats.org/package/2006/content-types";
+            var calculationChain = archive.CreateEntry("xl/calcChain.xml");
+            using (var output = calculationChain.Open())
+            {
+                new XDocument(
+                    new XElement(
+                        XName.Get("calcChain", "http://schemas.openxmlformats.org/spreadsheetml/2006/main"),
+                        new XElement(
+                            XName.Get("c", "http://schemas.openxmlformats.org/spreadsheetml/2006/main"),
+                            new XAttribute("r", "D2"),
+                            new XAttribute("i", "4"))))
+                    .Save(output);
+            }
+
+            var relationshipDocument = Load("xl/_rels/workbook.xml.rels");
+            relationshipDocument.Root!.Add(new XElement(
+                relationships + "Relationship",
+                new XAttribute("Id", "rIdCalcChain"),
+                new XAttribute("Type",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain"),
+                new XAttribute("Target", "calcChain.xml")));
+            Replace("xl/_rels/workbook.xml.rels", relationshipDocument);
+
+            var typeDocument = Load("[Content_Types].xml");
+            typeDocument.Root!.Add(new XElement(
+                contentTypes + "Override",
+                new XAttribute("PartName", "/xl/calcChain.xml"),
+                new XAttribute("ContentType",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml")));
+            Replace("[Content_Types].xml", typeDocument);
+
+            XDocument Load(string archivePath)
+            {
+                using var input = archive.GetEntry(archivePath)!.Open();
+                return XDocument.Load(input);
+            }
+
+            void Replace(string archivePath, XDocument document)
+            {
+                archive.GetEntry(archivePath)!.Delete();
+                using var output = archive.CreateEntry(archivePath).Open();
+                document.Save(output);
+            }
+        }
+
+        var current = GiftBoxWorkbookExporter.CreateFactorySubmissionSnapshot(
+            [entry],
+            observedAt,
+            path);
+        GiftBoxWorkbookExporter.Export(path, [entry], current);
+
+        using var rewritten = ZipFile.OpenRead(path);
+        Equal(null, rewritten.GetEntry("xl/calcChain.xml"),
+            "Rewriting formulas must remove Excel's stale calculation-chain part.");
+        using (var relationshipInput = rewritten.GetEntry("xl/_rels/workbook.xml.rels")!.Open())
+        {
+            var relationshipsDocument = XDocument.Load(relationshipInput);
+            True(!relationshipsDocument.Descendants().Any(element =>
+                    ((string?)element.Attribute("Type"))?.EndsWith("/calcChain", StringComparison.Ordinal) == true),
+                "Rewriting formulas must remove the stale calculation-chain relationship.");
+        }
+        using (var typeInput = rewritten.GetEntry("[Content_Types].xml")!.Open())
+        {
+            var typeDocument = XDocument.Load(typeInput);
+            True(!typeDocument.Descendants().Any(element =>
+                    (string?)element.Attribute("PartName") == "/xl/calcChain.xml"),
+                "Rewriting formulas must remove the stale calculation-chain content type.");
+        }
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    return Task.CompletedTask;
+}
+
 static Task SameSkuDifferentDateLinesKeepIdentityWhenReordered()
 {
     var synchronizedAt = DateTimeOffset.UtcNow;
@@ -3249,8 +3888,14 @@ static async Task ManualOverrideStatePersistsWorkbookPathAndRows()
             new ManualFieldOverride(true, "已確認"),
             DateTimeOffset.UtcNow);
         var store = new ManualOverrideStore(statePath);
+        var factorySnapshot = new FactorySubmissionSnapshot(
+            new DateTimeOffset(2026, 8, 20, 17, 0, 0, TimeSpan.FromHours(8)),
+            workbookPath,
+            [new FactorySubmissionLine(
+                "2026-08-13", "2026-08-20", "彰廠", "6入鐵盒2026年鐵盒(黑金袋)", 12m)]);
         await store.SaveAsync(new ManualOverrideState(
-            workbookPath, [row], [manual], [new WorkbookRowAutomaticReset(row.RowKey, row.SourceLineFingerprints)]));
+            workbookPath, [row], [manual], [new WorkbookRowAutomaticReset(row.RowKey, row.SourceLineFingerprints)],
+            factorySnapshot));
 
         var loaded = await new ManualOverrideStore(statePath).LoadAsync();
         Equal(Path.GetFullPath(workbookPath), loaded.LastWorkbookPath,
@@ -3259,6 +3904,10 @@ static async Task ManualOverrideStatePersistsWorkbookPathAndRows()
         Equal(1, loaded.Overrides.Count, "Manual overrides must be persisted independently from WMS history.");
         Equal(1, loaded.PendingAutomaticResets?.Count ?? 0,
             "A pending clear operation must survive until the next successful workbook export.");
+        Equal(12m, loaded.LastFactorySubmission!.Lines.Single().Quantity,
+            "The last factory submission baseline must survive application restarts.");
+        Equal(Path.GetFullPath(workbookPath), loaded.LastFactorySubmission.WorkbookPath,
+            "The factory submission must retain the formal workbook path it came from.");
         True(loaded.Overrides[0].OriginalDeliveryDate.IsOverridden &&
              loaded.Overrides[0].OriginalDeliveryDate.Value == "",
             "A persistent blank override must round-trip through JSON.");
@@ -3378,7 +4027,36 @@ static Task ClearedOverrideRestoresAutomaticFieldsInExistingWorkbook()
     return Task.CompletedTask;
 }
 
-static Task WorkbookUsesThreeConsolidatedWorksheetsAndNativeFormulas()
+static Task UnreadablePreviousWorkbookCanContinueAsNew()
+{
+    var previousRow = new WorkbookEditableRow(
+        "ROW", "detail", ["FINGERPRINT"], "2026-08-20", "2026-08-13",
+        "人工地點", "已確認", "蝦皮賣場", "ORDER-OLD", "六入", "AGGREGATE");
+    var manual = new OrderRowManualOverride(
+        "ROW", ["FINGERPRINT"],
+        new ManualFieldOverride(true, "2026-08-20"),
+        new ManualFieldOverride(true, "2026-08-13"),
+        new ManualFieldOverride(true, "人工地點"),
+        new ManualFieldOverride(true, "已確認"),
+        DateTimeOffset.UtcNow);
+    var previous = new ManualOverrideState(
+        "C:\\old\\legacy.xlsx", [previousRow], [manual]);
+
+    var continued = ManualOverrideWorkflow.ContinueWithNewWorkbook(previous);
+
+    Equal(null, continued.LastWorkbookPath,
+        "Continuing with a new workbook must allow the save dialog to choose a new path.");
+    Equal(0, continued.LastExportedRows.Count,
+        "An unreadable legacy workbook baseline must not be compared with the new workbook.");
+    Equal(1, continued.Overrides.Count,
+        "Already persisted manual overrides must remain available for the new workbook.");
+    Equal("人工地點", continued.Overrides.Single().Location.Value,
+        "Continuing as new must not discard persisted manual values.");
+
+    return Task.CompletedTask;
+}
+
+static Task WorkbookUsesFourConsolidatedWorksheetsAndNativeFormulas()
 {
     var path = Path.Combine(Path.GetTempPath(), $"mid-autumn-three-sheets-{Guid.NewGuid():N}.xlsx");
     var at = new DateTimeOffset(2026, 8, 7, 9, 0, 0, TimeSpan.FromHours(8));
@@ -3427,8 +4105,8 @@ static Task WorkbookUsesThreeConsolidatedWorksheetsAndNativeFormulas()
             var names = workbook.Descendants(ns + "sheet")
                 .Select(sheet => (string?)sheet.Attribute("name"))
                 .ToArray();
-            True(names.SequenceEqual(["訂單明細", "日期待確認", "統計"]),
-                "The workbook must contain exactly the three agreed worksheets in order.");
+            True(names.SequenceEqual(["訂單明細", "日期待確認", "統計", "本次補單"]),
+                "The workbook must contain exactly the four agreed worksheets in order.");
             var calculation = workbook.Descendants(ns + "calcPr").Single();
             Equal("1", (string?)calculation.Attribute("fullCalcOnLoad"),
                 "The workbook must request a full formula recalculation when opened.");
@@ -3691,6 +4369,8 @@ static Task WorkbookLocationUsesChannelMappingWithoutOverwritingManualValue()
         Entry("T", "臨新光三越台南新天地", "ORDER-T"),
         Entry("V", "YAHOO", "ORDER-V"),
         Entry("W", "阿瘦", "ORDER-W"),
+        Entry("Y", "PCHOME", "ORDER-Y"),
+        Entry("Z", " i預購 ", "ORDER-Z", "site2"),
         Entry("M", "官網", "ORDER-M", "manual_excel", "來源自訂地點"),
         Entry("P", "美安", "ORDER-P") with { DeliveryDate = null, OriginalDeliveryDate = null }
     };
@@ -3729,6 +4409,8 @@ static Task WorkbookLocationUsesChannelMappingWithoutOverwritingManualValue()
                 ["臨新光三越台南新天地"] = "彰廠",
                 ["YAHOO"] = "彰廠",
                 ["阿瘦"] = "彰廠",
+                ["PCHOME"] = "彰廠",
+                ["i預購"] = "彰廠",
                 ["POS 正-京站"] = "躉泰",
                 ["官網"] = "來源自訂地點"
             };
@@ -3938,7 +4620,7 @@ static Task WorkbookUsesDfkaiAndHasNoAutoFilters()
         Contains("styles", Read("[Content_Types].xml"), "The style content type is missing.");
         Contains("relationships/styles", Read("xl/_rels/workbook.xml.rels"),
             "The workbook style relationship is missing.");
-        foreach (var sheetPath in Enumerable.Range(1, 3).Select(index => $"xl/worksheets/sheet{index}.xml"))
+        foreach (var sheetPath in Enumerable.Range(1, 4).Select(index => $"xl/worksheets/sheet{index}.xml"))
         {
             var sheet = Read(sheetPath);
             DoesNotContain("autoFilter", sheet, $"{sheetPath} must not contain an automatic filter.");
@@ -4529,6 +5211,7 @@ static async Task LocalHistoryResetIsRecoverable()
     {
         ["sync-status.json"] = "OLD-STATUS",
         ["order-snapshot.json"] = "OLD-SNAPSHOT",
+        ["order-snapshot.staged.json"] = "OLD-STAGED-SNAPSHOT",
         ["order-change-ledger.json"] = "OLD-LEDGER"
     };
 

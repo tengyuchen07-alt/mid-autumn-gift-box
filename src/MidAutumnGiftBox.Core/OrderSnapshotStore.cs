@@ -106,12 +106,7 @@ public sealed class OrderSnapshotStore
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(replacement);
-        EnsureUniqueKeys(replacement);
-        var ordered = replacement
-            .OrderBy(line => line.SourceCode, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(line => line.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var ordered = NormalizeReplacement(replacement);
 
         await _fileLock.WaitAsync(cancellationToken);
         try
@@ -123,6 +118,18 @@ public sealed class OrderSnapshotStore
         {
             _fileLock.Release();
         }
+    }
+
+    internal static OrderLineSnapshot[] NormalizeReplacement(
+        IReadOnlyList<OrderLineSnapshot> replacement)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        EnsureUniqueKeys(replacement);
+        return replacement
+            .OrderBy(line => line.SourceCode, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(line => line.ExternalOrderNo, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(line => line.ExternalLineKey, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     public async Task ReplaceSourceRangeAsync(
